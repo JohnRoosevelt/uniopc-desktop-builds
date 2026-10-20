@@ -94,6 +94,9 @@ jobs:
           UNIOPC_PREPARED_OPENCLAW_RUNTIME_DIR: ${{ github.workspace }}/.prepared-runtime
         run: |
           : > .env.release
+          export PATH="/c/Strawberry/perl/bin:$PATH"
+          command -v perl
+          perl -MLocale::Maketext::Simple -e 'print "Build Perl ready\n"'
           npm run build:release -- --target x86_64-pc-windows-msvc
       - name: Record signed build provenance
         run: >-

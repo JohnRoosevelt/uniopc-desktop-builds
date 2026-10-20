@@ -61,6 +61,12 @@ test('signing credentials exist only in protected jobs and key verification/sign
   assert.match(windows, /name: desktop-release-windows-x86_64-\$\{\{ github.run_attempt \}\}/)
   assert.doesNotMatch(job(windows, 'prepare-openclaw-runtime-windows'), /environment:|secrets\./)
 })
+test('Windows signing build selects and probes Strawberry Perl inside the build Bash shell', () => {
+  const build = job(windows, 'windows').split(/^      - /m).find(step => step.startsWith('name: Build and sign Windows updater'))
+  assert.ok(build)
+  assert.match(build, /shell: bash/)
+  assert.match(build, /export PATH="\/c\/Strawberry\/perl\/bin:\$PATH"\n          command -v perl\n          perl -MLocale::Maketext::Simple -e 'print "Build Perl ready\\n"'\n          npm run build:release -- --target x86_64-pc-windows-msvc/)
+})
 test('verification uses read-only permissions without production environment; preview skips production job entirely', () => {
   const verify = job(promote, 'verify-candidate'), publish = job(promote, 'publish-candidate')
   assert.doesNotMatch(verify, /environment:|secrets\.|actions: write/)
