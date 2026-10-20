@@ -1,0 +1,105 @@
+name: Desktop Publish Candidate
+on:
+  push:
+    tags: ['publish/**', 'verify-publish/**']
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: desktop-stable-promotion
+  cancel-in-progress: false
+jobs:
+  verify-candidate:
+    if: github.event_name == 'push' && github.repository == 'JohnRoosevelt/uniopc-desktop-builds' && github.actor == 'JohnRoosevelt' && github.triggering_actor == 'JohnRoosevelt'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      source_tag: ${{ steps.source.outputs.source_tag }}
+      source_commit: ${{ steps.source.outputs.source_commit }}
+      source_run_id: ${{ steps.source.outputs.source_run_id }}
+      source_attempt: ${{ steps.source.outputs.source_attempt }}
+      dry_run: ${{ steps.source.outputs.dry_run }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - run: node scripts/public-release-guard.mjs promotion
+      - name: Bind request to the exact successful owner candidate
+        id: source
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+        with:
+          script: |
+            const { parsePromotionTag, validatePromotionSource } = await import(`${process.env.GITHUB_WORKSPACE}/scripts/desktop-candidate-promotion.mjs`);
+            const { execFileSync } = await import('node:child_process');
+            const request = parsePromotionTag(process.env.GITHUB_REF_NAME);
+            const run_id = Number(request.runId), attempt_number = Number(request.runAttempt);
+            const run = (await github.rest.actions.getWorkflowRunAttempt({ ...context.repo, run_id, attempt_number })).data;
+            execFileSync('git', ['merge-base', '--is-ancestor', run.head_sha, 'refs/remotes/origin/main']);
+            const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRunAttempt, { ...context.repo, run_id, attempt_number });
+            const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts, { ...context.repo, run_id });
+            const comparison = run.head_sha === context.sha ? undefined : (await github.rest.repos.compareCommitsWithBasehead({ ...context.repo, basehead: `${run.head_sha}...${context.sha}` })).data;
+            const source = validatePromotionSource({ run, jobs, artifacts, request, commit: context.sha, comparison });
+            for (const [name, value] of Object.entries(source)) if (name !== 'artifacts') core.setOutput(name, value);
+            core.setOutput('artifact_ids', source.artifacts.map(a => a.id).join(','));
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.source.outputs.source_run_id }}
+          artifact-ids: ${{ steps.source.outputs.artifact_ids }}
+          path: downloaded
+      - name: Verify approved bytes, signature, provenance and live version without credentials
+        env:
+          SOURCE_TAG: ${{ steps.source.outputs.source_tag }}
+          SOURCE_COMMIT: ${{ steps.source.outputs.source_commit }}
+        run: node scripts/verify-promotion-download.mjs prepare
+      - name: Retain verified bytes for production job
+        if: steps.source.outputs.dry_run == 'false'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: approved-promotion-${{ github.run_attempt }}
+          path: approved
+          retention-days: 1
+          if-no-files-found: error
+  publish-candidate:
+    needs: verify-candidate
+    if: needs.verify-candidate.outputs.dry_run == 'false' && github.repository == 'JohnRoosevelt/uniopc-desktop-builds' && github.actor == 'JohnRoosevelt' && github.triggering_actor == 'JohnRoosevelt'
+    environment: desktop-production
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - run: node scripts/public-release-guard.mjs promotion
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: approved-promotion-${{ github.run_attempt }}
+          path: approved
+      - name: Reverify exact approved bytes before loading publication credentials
+        env:
+          SOURCE_TAG: ${{ needs.verify-candidate.outputs.source_tag }}
+          SOURCE_COMMIT: ${{ needs.verify-candidate.outputs.source_commit }}
+        run: node scripts/verify-promotion-download.mjs
+      - name: Publish the approved bytes under global storage lock, without rebuilding
+        env:
+          SUPABASE_STORAGE_API_KEY: ${{ secrets.SUPABASE_STORAGE_API_KEY }}
+          IMAI_RELEASE_PUBLISH_TOKEN: ${{ secrets.IMAI_RELEASE_PUBLISH_TOKEN }}
+          SOURCE_TAG: ${{ needs.verify-candidate.outputs.source_tag }}
+          SOURCE_RUN_ID: ${{ needs.verify-candidate.outputs.source_run_id }}
+          SOURCE_ATTEMPT: ${{ needs.verify-candidate.outputs.source_attempt }}
+          SOURCE_COMMIT: ${{ needs.verify-candidate.outputs.source_commit }}
+        run: >-
+          node scripts/desktop-release-candidate.mjs publish
+          --tag "$SOURCE_TAG" --commit "$SOURCE_COMMIT"
+          --run-id "$SOURCE_RUN_ID" --run-attempt "$SOURCE_ATTEMPT"
+          --artifacts-dir approved/release --output published-candidate.json

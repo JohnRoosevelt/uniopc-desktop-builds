@@ -1,0 +1,74 @@
+name: Desktop Release
+on:
+  push:
+    tags: ['test/windows/*']
+permissions:
+  contents: read
+jobs:
+  authorize:
+    if: github.event_name == 'push' && github.repository == 'JohnRoosevelt/uniopc-desktop-builds' && github.actor == 'JohnRoosevelt' && github.triggering_actor == 'JohnRoosevelt'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - run: node scripts/public-release-guard.mjs candidate
+  preflight-signing-keys:
+    needs: authorize
+    runs-on: ubuntu-latest
+    environment: desktop-signing
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - run: node scripts/check-updater-signing-keys.mjs --platforms windows
+      - run: node --input-type=module -e 'import { readDesktopReleaseVersion } from "./scripts/prepare-desktop-updater-release.mjs"; console.log(await readDesktopReleaseVersion())'
+      - run: npm ci --legacy-peer-deps
+      - name: Verify Windows signing key before expensive checks
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_WINDOWS }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
+        run: node scripts/verify-updater-signing-key.mjs windows
+  windows:
+    needs: preflight-signing-keys
+    uses: ./.github/workflows/desktop-build-windows.yml
+  stage-candidate:
+    needs: [preflight-signing-keys, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: desktop-release-windows-x86_64-${{ github.run_attempt }}
+          path: release/windows-x86_64
+      - name: Verify signed bundles and record exact public candidate
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: >-
+          node scripts/desktop-release-candidate.mjs package
+          --tag "$RELEASE_TAG" --commit "$GITHUB_SHA"
+          --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"
+          --artifacts-dir release --output candidate.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          retention-days: 3
+          name: desktop-candidate-manifest-${{ github.run_attempt }}
+          path: candidate.json
+          if-no-files-found: error

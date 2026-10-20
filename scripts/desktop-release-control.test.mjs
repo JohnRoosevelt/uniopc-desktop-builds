@@ -30,3 +30,10 @@ test('preview creates no tags; a new request pushes only the one named tag', () 
   assert.deepEqual(calls.at(-1), ['push', 'origin', `refs/tags/publish/${id}:refs/tags/publish/${id}`])
   assert.ok(!calls.filter(args => args[0] === 'push').flat().some(value => value === '--force' || value === '--tags'))
 })
+
+test('public controller rejects private/fork/misleading origins', async () => {
+  const { validateReleaseOrigin } = await import('./desktop-release-control.mjs')
+  for (const remote of ['git@github.com:JohnRoosevelt/uniopc-desktop-builds.git', 'https://github.com/JohnRoosevelt/uniopc-desktop-builds', 'ssh://git@github.com/JohnRoosevelt/uniopc-desktop-builds.git']) validateReleaseOrigin(remote)
+  for (const remote of ['git@github.com:0xbootiful/uniopc-desktop.git', 'https://github.com/fork/uniopc-desktop-builds', 'https://github.com/JohnRoosevelt/uniopc-desktop-builds/extra', 'https://evil.example/JohnRoosevelt/uniopc-desktop-builds', 'https://github.com/JohnRoosevelt/uniopc-desktop-builds.git?token=x']) assert.throws(() => validateReleaseOrigin(remote))
+  assert.throws(() => publicationRequest(id.replace('windows-', 'macos-'), commit))
+})

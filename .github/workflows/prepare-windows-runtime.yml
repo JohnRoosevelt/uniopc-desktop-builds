@@ -1,0 +1,41 @@
+name: Prepare Windows runtime cache
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  prepare:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.repository == 'JohnRoosevelt/uniopc-desktop-builds' && github.actor == 'JohnRoosevelt' && github.triggering_actor == 'JohnRoosevelt'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - run: node scripts/public-release-guard.mjs warm
+      - run: npm ci --legacy-peer-deps
+      - id: runtime-key
+        run: node scripts/windows-runtime-cache.mjs key
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        id: runtime-cache
+        with:
+          key: ${{ steps.runtime-key.outputs.key }}
+          path: |
+            src-tauri/resources/uniopc-engine-runtime/uniopc-engine-runtime-win32-x64.tar.gz
+            src-tauri/resources/uniopc-engine-runtime/uniopc-engine-runtime.catalog.json
+      - name: Build runtime only on exact cache miss
+        if: steps.runtime-cache.outputs.cache-hit != 'true'
+        run: npm run build:openclaw-runtime -- --force --platform win32 --arch x64
+      - name: Verify runtime hash, contract and whitelabel on every hit or build
+        run: node scripts/windows-runtime-cache.mjs verify
+      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        if: steps.runtime-cache.outputs.cache-hit != 'true'
+        with:
+          key: ${{ steps.runtime-key.outputs.key }}
+          path: |
+            src-tauri/resources/uniopc-engine-runtime/uniopc-engine-runtime-win32-x64.tar.gz
+            src-tauri/resources/uniopc-engine-runtime/uniopc-engine-runtime.catalog.json

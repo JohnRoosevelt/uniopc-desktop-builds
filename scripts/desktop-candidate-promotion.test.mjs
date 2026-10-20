@@ -7,7 +7,7 @@ function fixture() {
   return {
     commit,
     request: parsePromotionTag(`publish/windows-v0.4.19-${commit.slice(0, 12)}-123-2`),
-    run: { id: 123, run_attempt: 2, repository: { full_name: '0xbootiful/uniopc-desktop' }, head_repository: { full_name: '0xbootiful/uniopc-desktop' }, head_sha: commit, head_branch: 'test/windows/v0.4.19-1', path: '.github/workflows/desktop-release.yml', event: 'push', status: 'completed', conclusion: 'success' },
+    run: { actor: { login: 'JohnRoosevelt' }, triggering_actor: { login: 'JohnRoosevelt' }, id: 123, run_attempt: 2, repository: { full_name: 'JohnRoosevelt/uniopc-desktop-builds' }, head_repository: { full_name: 'JohnRoosevelt/uniopc-desktop-builds' }, head_sha: commit, head_branch: 'test/windows/v0.4.19-1', path: '.github/workflows/desktop-release.yml', event: 'push', status: 'completed', conclusion: 'success' },
     jobs: [{ name: 'preflight-signing-keys', conclusion: 'success' }, { name: 'stage-candidate', conclusion: 'success' }],
     artifacts: [{ id: 1, name: 'desktop-candidate-manifest-2', expired: false }, { id: 2, name: 'desktop-release-windows-x86_64-2', expired: false }],
   }
@@ -24,6 +24,11 @@ test('publication rejects forks, wrong attempts, failed checks, expired or ambig
     f => { f.run.head_repository.full_name = 'fork/repo' },
     f => { f.run.path = '.github/workflows/other.yml' },
     f => { f.run.event = 'workflow_dispatch' },
+    f => { f.run.event = 'pull_request' },
+    f => { f.run.actor.login = 'other' },
+    f => { f.run.triggering_actor.login = 'other' },
+    f => { f.run.repository.full_name = '0xbootiful/uniopc-desktop' },
+    f => { f.run.head_branch = 'windows/v0.4.19' },
     f => { f.run.status = 'in_progress' },
     f => { f.run.conclusion = 'failure' },
     f => { f.run.head_sha = 'b'.repeat(40) },

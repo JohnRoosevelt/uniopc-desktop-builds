@@ -9,10 +9,14 @@ import { readDesktopReleaseVersion } from './prepare-desktop-updater-release.mjs
 import { planRelease } from './desktop-release-candidate.mjs'
 import { verifyPublisherUpdate } from './desktop-candidate-promotion.mjs'
 
+export function validateReleaseOrigin(remote) {
+  if (!/^(git@github\.com:|https:\/\/github\.com\/|ssh:\/\/git@github\.com\/)JohnRoosevelt\/uniopc-desktop-builds(?:\.git)?$/.test(remote)) throw new Error('Release commands require the exact JohnRoosevelt/uniopc-desktop-builds origin')
+}
+
 const ROOT = resolve(import.meta.dirname, '..')
 export function publicationRequest(candidateId, commit, verifyOnly = false) {
   const match = String(candidateId).match(/^(all|desktop|macos|windows)-v((?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))-([a-f0-9]{12})-([1-9][0-9]*)-([1-9][0-9]*)$/)
-  if (!match || !/^[a-f0-9]{40}$/.test(commit) || !commit.startsWith(match[3])) throw new Error('Provide the exact candidate ID and its full tested commit SHA')
+  if (!match || match[1] !== 'windows' || !/^[a-f0-9]{40}$/.test(commit) || !commit.startsWith(match[3])) throw new Error('Provide the exact candidate ID and its full tested commit SHA')
   return { tag: `${verifyOnly ? 'verify-publish' : 'publish'}/${candidateId}`, commit }
 }
 
@@ -48,12 +52,12 @@ async function main(argv) {
     return r.stdout
   }
   const remote = git(['remote', 'get-url', 'origin']).trim()
-  if (!/^(git@github\.com:|https:\/\/github\.com\/|ssh:\/\/git@github\.com\/)0xbootiful\/uniopc-desktop(?:\.git)?$/.test(remote)) throw new Error('Release commands require the uniopc-desktop origin')
+  validateReleaseOrigin(remote)
   let request
   if (operation === 'candidate') {
     if (git(['status', '--porcelain']).trim()) throw new Error('Commit candidate code before requesting a build')
     const platform = args.platform || 'windows'
-    if (!['all', 'macos', 'windows'].includes(platform)) throw new Error('Platform must be all, macos or windows')
+    if (platform !== 'windows') throw new Error('Public builds support Windows only')
     const version = await readDesktopReleaseVersion()
     const prefix = `test/${platform === 'all' ? '' : platform + '/'}v${version}-`
     const existing = git(['ls-remote', '--tags', 'origin', `refs/tags/${prefix}*`])
@@ -78,7 +82,7 @@ async function main(argv) {
     }
     const publisher = git(['show', `${request.commit}:.github/workflows/desktop-promote.yml`])
     if (!publisher.includes("tags: ['publish/**', 'verify-publish/**']")) throw new Error('Candidate predates the internal publication workflow; generate a new candidate first')
-  } else throw new Error('Use candidate --platform windows|macos|all or publish --candidate ID --commit SHA [--verify-only]')
+  } else throw new Error('Use candidate --platform windows or publish --candidate ID --commit SHA [--verify-only]')
   console.log(JSON.stringify(pushTagOnce(request.tag, request.commit, git, args['dry-run']), null, 2))
   console.log('Follow the matching tag run with the GitHub plugin; no browser is needed.')
 }

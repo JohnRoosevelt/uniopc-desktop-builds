@@ -22,15 +22,17 @@ export function verifyPublisherUpdate(sourceCommit, controllerCommit, comparison
 }
 export function parsePromotionTag(tag) {
   const match = String(tag).match(new RegExp(`^(publish|verify-publish)/((all|desktop|macos|windows)-v(${versionPattern})-([a-f0-9]{12})-([1-9][0-9]*)-([1-9][0-9]*))$`))
-  require(match, 'Use publish/CANDIDATE-ID or verify-publish/CANDIDATE-ID')
+  require(match && match[3] === 'windows', 'Use publish/CANDIDATE-ID or verify-publish/CANDIDATE-ID')
   require(Number.isSafeInteger(Number(match[6])) && Number.isSafeInteger(Number(match[7])), 'Invalid source run or attempt')
   return { candidateId: match[2], version: match[4], runId: match[6], runAttempt: match[7], dryRun: match[1] === 'verify-publish' }
 }
 
 export function validatePromotionSource({ run, jobs, artifacts, request, commit, comparison }) {
-  require(run.repository?.full_name === '0xbootiful/uniopc-desktop' && run.head_repository?.full_name === '0xbootiful/uniopc-desktop', 'Candidate must come from this repository')
+  require(run.repository?.full_name === 'JohnRoosevelt/uniopc-desktop-builds' && run.head_repository?.full_name === 'JohnRoosevelt/uniopc-desktop-builds', 'Candidate must come from this repository')
   require(run.event === 'push' && run.path === '.github/workflows/desktop-release.yml', 'Candidate must come from the tag candidate workflow')
   require(run.status === 'completed' && run.conclusion === 'success', 'Candidate run must have completed successfully')
+  require(run.actor?.login === 'JohnRoosevelt' && run.triggering_actor?.login === 'JohnRoosevelt', 'Candidate requires owner actors')
+  require(/^test\/windows\/v\d+\.\d+\.\d+-[1-9]\d*$/.test(run.head_branch), 'Candidate requires a Windows test tag')
   verifyPublisherUpdate(run.head_sha, commit, comparison)
   const sourceCommit = run.head_sha
   require(String(run.id) === request.runId && String(run.run_attempt) === request.runAttempt, 'Candidate run/attempt mismatch')
