@@ -1,6 +1,9 @@
 name: Desktop Build Windows
 on:
   workflow_call:
+    secrets:
+      TAURI_SIGNING_PRIVATE_KEY_WINDOWS:
+        required: true
 permissions:
   contents: read
 jobs:

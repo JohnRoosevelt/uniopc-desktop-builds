@@ -42,6 +42,8 @@ jobs:
   windows:
     needs: preflight-signing-keys
     uses: ./.github/workflows/desktop-build-windows.yml
+    secrets:
+      TAURI_SIGNING_PRIVATE_KEY_WINDOWS: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_WINDOWS }}
   stage-candidate:
     needs: [preflight-signing-keys, windows]
     runs-on: ubuntu-latest

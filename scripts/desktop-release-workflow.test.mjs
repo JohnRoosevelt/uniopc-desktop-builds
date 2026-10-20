@@ -32,12 +32,22 @@ test('secret-bearing candidate chain starts after owner/tag/main ancestry author
     assert.equal(evaluateJob(gate, owner), true)
     for (const mutation of [{ repository: 'fork/repo' }, { actor: 'other' }, { triggering_actor: 'other' }, { event_name: 'pull_request' }]) assert.equal(evaluateJob(gate, { ...owner, ...mutation }), false)
   }
-  assert.doesNotMatch(windows, /workflow_dispatch|secrets:\n/)
+  assert.doesNotMatch(windows, /workflow_dispatch|secrets: inherit/)
   assert.match(checks, /public-release-guard\.mjs candidate/)
+})
+test('Windows reusable workflow requires and explicitly forwards only its named signing key', () => {
+  assert.match(windows, /on:\n  workflow_call:\n    secrets:\n      TAURI_SIGNING_PRIVATE_KEY_WINDOWS:\n        required: true\npermissions:/)
+  const caller = job(candidate, 'windows')
+  assert.match(caller, /needs: preflight-signing-keys/)
+  assert.match(caller, /uses: \.\/\.github\/workflows\/desktop-build-windows\.yml\n    secrets:\n      TAURI_SIGNING_PRIVATE_KEY_WINDOWS: \$\{\{ secrets\.TAURI_SIGNING_PRIVATE_KEY_WINDOWS \}\}\n$/)
+  assert.doesNotMatch(candidate + windows, /secrets: inherit/)
+  assert.match(job(windows, 'windows'), /environment: desktop-signing/)
+  assert.match(job(candidate, 'preflight-signing-keys'), /environment: desktop-signing/)
 })
 test('signing credentials exist only in protected jobs and key verification/signing steps', () => {
   for (const document of [candidate, windows]) {
     for (const section of document.split(/(?=^  [\w-]+:\n)/m).filter(s => s.includes('secrets.'))) {
+      if (section === job(candidate, 'windows')) continue // Named forwarding is checked above; execution remains environment-protected.
       assert.match(section, /environment: desktop-signing/)
       for (const step of section.split(/^      - /m).filter(s => s.includes('secrets.'))) {
         assert.match(step, /verify-updater-signing-key\.mjs windows|npm run build:release/)
