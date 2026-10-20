@@ -1,0 +1,35 @@
+{
+  "$schema": "https://raw.githubusercontent.com/niceda/tauri-v2-schema/main/tauri.conf.json",
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEVFQjRDNEEyRDc0NDlENDkKUldSSm5VVFhvc1MwN2tUb3AyOURpb1FxVWFjM1pYWms5VmNXL0cxQmRuMm1DUWlwVlo5Wmdyem4K"
+    }
+  },
+  "bundle": {
+    "targets": ["nsis"],
+    "windows": {
+      "nsis": {
+        "languages": ["SimpChinese"],
+        "customLanguageFiles": {
+          "SimpChinese": "resources/nsis/SimpChinese.nsh"
+        },
+        "installerHooks": "resources/nsis/installer-hooks.nsh"
+      }
+    }
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "",
+        "width": 1200,
+        "height": 800,
+        "minWidth": 960,
+        "minHeight": 640,
+        "center": true,
+        "resizable": true,
+        "fullscreen": false,
+        "decorations": false
+      }
+    ]
+  }
+}

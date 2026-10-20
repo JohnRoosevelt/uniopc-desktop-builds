@@ -1,0 +1,12 @@
+FROM node:24.19.0-bookworm-slim@sha256:a9f5f7c91a432850b2a8a7797adf5eadb6c733ceed61167806cee7ea7fbc29df
+
+RUN groupadd --gid 65532 audit && useradd --uid 65532 --gid 65532 --no-create-home --home-dir /audit-work/home audit
+WORKDIR /opt/uniopc-audit
+COPY --chown=65532:65532 scripts/openclaw-plugin-audit-worker/package.json scripts/openclaw-plugin-audit-worker/package-lock.json ./
+RUN npm ci --ignore-scripts && npm cache clean --force
+COPY --chown=65532:65532 scripts/audit-openclaw-plugin.mjs ./scripts/audit-openclaw-plugin.mjs
+COPY --chown=65532:65532 scripts/verify-openclaw-release-contract.mjs ./scripts/verify-openclaw-release-contract.mjs
+COPY --chown=65532:65532 scripts/openclaw-plugin-audit-worker.lock.json ./scripts/openclaw-plugin-audit-worker.lock.json
+COPY --chown=65532:65532 scripts/openclaw-plugin-audit-worker/entrypoint.mjs ./scripts/openclaw-plugin-audit-worker/entrypoint.mjs
+USER 65532:65532
+ENTRYPOINT ["node", "scripts/openclaw-plugin-audit-worker/entrypoint.mjs"]

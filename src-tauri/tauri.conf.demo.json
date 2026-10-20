@@ -1,0 +1,48 @@
+{
+  "productName": "Demo Studio",
+  "identifier": "com.example.demo",
+  "build": {
+    "beforeDevCommand": "npm run dev:brand",
+    "beforeBuildCommand": "npm run build:brand"
+  },
+  "app": {
+    "security": {
+      "assetProtocol": {
+        "enable": true,
+        "scope": [
+          "$DATA/DemoStudio/state/*/media/**",
+          "$DATA/DemoStudio/workspaces/**",
+          "$DATA/DemoStudio/state/*/tmp/uniopc-superip/**",
+          "$DATA/DemoStudio/employees/**",
+          "$DATA/demostudio/state/*/media/**",
+          "$DATA/demostudio/workspaces/**",
+          "$DATA/demostudio/state/*/tmp/uniopc-superip/**",
+          "$DATA/demostudio/employees/**"
+        ]
+      },
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost blob: data: https:; media-src 'self' asset: http://asset.localhost blob:; font-src 'self' data:; worker-src 'self' blob:; connect-src 'self' ipc: http://ipc.localhost https://api.imai.app wss://api.imai.app https://*.opentrust.net wss://*.opentrust.net https://rzxdwuccqjwhrxtpdvlw.supabase.co wss://rzxdwuccqjwhrxtpdvlw.supabase.co; object-src 'none'; base-uri 'self'",
+      "devCsp": "default-src 'self' http://127.0.0.1:1420; script-src 'self' http://127.0.0.1:1420; style-src 'self' 'unsafe-inline' http://127.0.0.1:1420; img-src 'self' asset: http://asset.localhost blob: data: https:; media-src 'self' asset: http://asset.localhost blob:; font-src 'self' data:; worker-src 'self' blob:; connect-src 'self' ipc: http://ipc.localhost ws://127.0.0.1:1420 http://127.0.0.1:1420 https://api.imai.app wss://api.imai.app https://*.opentrust.net wss://*.opentrust.net https://rzxdwuccqjwhrxtpdvlw.supabase.co wss://rzxdwuccqjwhrxtpdvlw.supabase.co; object-src 'none'; base-uri 'self'"
+    }
+  },
+  "bundle": {
+    "icon": [
+      "icons-demo/32x32.png",
+      "icons-demo/128x128.png",
+      "icons-demo/128x128@2x.png",
+      "icons-demo/icon.icns",
+      "icons-demo/icon.ico"
+    ],
+    "macOS": {
+      "signingIdentity": "-",
+      "entitlements": "Entitlements.plist"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IGRlbW8gcGxhY2Vob2xkZXIgcHVibGljIGtleQpERU1PREVNT0RFTU8K",
+      "endpoints": [
+        "https://demo.example.com/desktop-releases/stable/{{target}}/{{arch}}/latest.json"
+      ]
+    }
+  }
+}

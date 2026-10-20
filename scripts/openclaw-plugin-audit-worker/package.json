@@ -1,0 +1,12 @@
+{
+  "name": "@uniopc/openclaw-plugin-audit-worker",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "@babel/parser": "7.29.2",
+    "@babel/traverse": "7.29.0",
+    "@openclaw/plugin-inspector": "0.3.24",
+    "tar": "7.5.22"
+  }
+}

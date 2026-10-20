@@ -1,0 +1,12 @@
+{
+  "type": "event",
+  "event": "chat",
+  "seq": 43,
+  "payload": {
+    "runId": "<redacted-run-id>",
+    "sessionKey": "<redacted-session-key>",
+    "seq": 7,
+    "state": "error",
+    "errorMessage": "authentication failed for token <redacted-token> at <redacted-path>"
+  }
+}

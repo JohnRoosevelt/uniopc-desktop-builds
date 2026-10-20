@@ -1,0 +1,8 @@
+{
+  "name": "@uniopc/openclaw-documents-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "openclaw": { "extensions": ["./index.js"], "compat": { "pluginApi": ">=2026.8.1 <2027.0.0" } }
+}

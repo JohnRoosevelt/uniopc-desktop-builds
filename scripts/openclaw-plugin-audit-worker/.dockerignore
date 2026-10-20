@@ -1,0 +1,7 @@
+# Repository-root builds select Containerfile.dockerignore. This file keeps the
+# worker directory self-contained for tooling that inspects the worker directly.
+*
+!Containerfile
+!entrypoint.mjs
+!package.json
+!package-lock.json

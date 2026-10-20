@@ -1,0 +1,49 @@
+{
+  "type": "hello-ok",
+  "protocol": 4,
+  "server": {
+    "version": "2026.8.1",
+    "connId": "00000000-0000-4000-8000-000000000000",
+    "controlUiBuildSource": "bundled",
+    "futureServerField": "ignored"
+  },
+  "features": {
+    "methods": [
+      "agents.files.list",
+      "agents.files.get",
+      "agents.files.set",
+      "sessions.list"
+    ],
+    "events": ["sessions.changed"],
+    "capabilities": ["session-scoped-chat-metadata"],
+    "futureFeature": true
+  },
+  "snapshot": {
+    "presence": [],
+    "health": { "ok": true },
+    "stateVersion": { "presence": 1, "health": 10 },
+    "uptimeMs": 194445,
+    "sessionDefaults": {
+      "defaultAgentId": "dev",
+      "ownership": "sole",
+      "selectionRequired": false,
+      "scope": "per-sender"
+    },
+    "authMode": "token"
+  },
+  "auth": {
+    "role": "operator",
+    "scopes": ["operator.read", "operator.write", "operator.admin"]
+  },
+  "policy": {
+    "maxPayload": 26214400,
+    "maxBufferedBytes": 52428800,
+    "tickIntervalMs": 30000,
+    "attachments": {
+      "maxBytes": 19464192,
+      "maxImageBytes": 6291456
+    },
+    "allowedSessionVisibilities": ["shared", "read-only", "suggest", "draft"]
+  },
+  "futureTopLevelField": { "ignored": true }
+}

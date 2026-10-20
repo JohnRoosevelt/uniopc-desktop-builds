@@ -1,0 +1,34 @@
+{
+  "ensureUser": {
+    "request": {
+      "schemaVersion": 1,
+      "action": "ensure-user",
+      "marker": "uniopc-openclaw-release-validation-v1",
+      "slug": "openclaw-release-validation",
+      "payload": {
+        "email": "openclaw-release-validation@invalid.uniopc",
+        "password": "contract-fixture-password"
+      }
+    },
+    "fixture": {
+      "marker": "uniopc-openclaw-release-validation-v1",
+      "slug": "openclaw-release-validation",
+      "userId": "fixture-user-id",
+      "userEmail": "openclaw-release-validation@invalid.uniopc",
+      "organizationId": "fixture-organization-id",
+      "memberId": "fixture-member-id",
+      "profileId": "fixture-profile-id",
+      "employeeId": "fixture-employee-id",
+      "profileKey": "openclaw-release-validation"
+    },
+    "response": {
+      "ok": true,
+      "result": {
+        "id": "fixture-user-id",
+        "marker": "uniopc-openclaw-release-validation-v1",
+        "organizationSlug": "openclaw-release-validation",
+        "email": "openclaw-release-validation@invalid.uniopc"
+      }
+    }
+  }
+}

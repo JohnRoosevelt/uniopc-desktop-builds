@@ -1,0 +1,41 @@
+.DS_Store
+node_modules/
+dist/
+!src-tauri/resources/plugins/uniopc/uniopc-local-workspace/dist/
+!src-tauri/resources/plugins/uniopc/uniopc-local-workspace/dist/**
+dist-*/
+src-tauri/target/
+release/
+reports/
+.temp/
+.tmp/
+.worktrees/
+.superpowers/
+.env.release
+.env.v2.local
+# Updater private keys and local password backups must never enter Git.
+*.key
+*.key.password
+# Bundled OpenClaw runtime artifacts are rebuilt per release; never commit them.
+src-tauri/resources/openclaw-runtime/*.tar.gz
+src-tauri/resources/openclaw-runtime/openclaw-runtime.version
+src-tauri/resources/openclaw-runtime/openclaw-runtime.catalog.json
+# Uniopc-branded runtime artifacts replace the legacy bundle path for new builds.
+src-tauri/resources/uniopc-engine-runtime/*.tar.gz
+src-tauri/resources/uniopc-engine-runtime/uniopc-engine-runtime.version
+src-tauri/resources/uniopc-engine-runtime/uniopc-engine-runtime.catalog.json
+
+.env.desktop-release.local
+
+.release-secrets/
+# Deterministic offline pure-JS plugin dependencies, generated before builds.
+src-tauri/resources/plugins/openclaw/uniopc-presentations/lib/
+src-tauri/resources/plugins/uniopc/uniopc-presentations/lib/
+
+# Public snapshot: keep local configuration and private material out.
+.env.*.local
+.env.local
+.env.dev
+*.pem
+*.p12
+*.pfx

@@ -1,0 +1,86 @@
+{
+  "$schema": "https://raw.githubusercontent.com/niceda/tauri-v2-schema/main/tauri.conf.json",
+  "productName": "Uniopc",
+  "version": "0.4.19",
+  "identifier": "com.imai.app",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [
+      {
+        "title": "",
+        "width": 1200,
+        "height": 800,
+        "minWidth": 960,
+        "minHeight": 640,
+        "center": true,
+        "resizable": true,
+        "fullscreen": false,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "trafficLightPosition": {
+          "x": 18,
+          "y": 18
+        }
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost blob: data: https:; media-src 'self' asset: http://asset.localhost blob:; font-src 'self' data:; worker-src 'self' blob:; connect-src 'self' ipc: http://ipc.localhost https://api.imai.app wss://api.imai.app https://*.opentrust.net wss://*.opentrust.net https://uniopc-ywriting-apoxivoeyq.cn-hangzhou.fcapp.run https://uniopc-eo-clips-aiwlkdpyyi.cn-hangzhou.fcapp.run https://uniopc-ips-prod-dscgwuprhl.cn-hangzhou.fcapp.run; frame-src 'self' asset: http://asset.localhost; object-src 'none'; base-uri 'self'",
+      "devCsp": "default-src 'self' http://127.0.0.1:1420; script-src 'self' http://127.0.0.1:1420; style-src 'self' 'unsafe-inline' http://127.0.0.1:1420; img-src 'self' asset: http://asset.localhost blob: data: https:; media-src 'self' asset: http://asset.localhost blob:; font-src 'self' data:; worker-src 'self' blob:; connect-src 'self' ipc: http://ipc.localhost ws://127.0.0.1:1420 http://127.0.0.1:1420 https://api.imai.app wss://api.imai.app https://*.opentrust.net wss://*.opentrust.net https://uniopc-ywriting-apoxivoeyq.cn-hangzhou.fcapp.run https://uniopc-eo-clips-aiwlkdpyyi.cn-hangzhou.fcapp.run https://uniopc-ips-prod-dscgwuprhl.cn-hangzhou.fcapp.run; object-src 'none'; base-uri 'self'",
+      "assetProtocol": {
+        "enable": true,
+        "scope": [
+          "$DATA/Uniopc/state/*/media/**",
+          "$DATA/Uniopc/state/*/workspace/**",
+          "$DATA/Uniopc/state-v8/**/media/**",
+          "$DATA/Uniopc/state-v8/**/workspace/**",
+          "$DATA/Uniopc/workspaces/**",
+          "$DATA/Uniopc/state/*/tmp/uniopc-superip/**",
+          "$DATA/Uniopc/employees/**",
+          "$DATA/uniopc/state/*/media/**",
+          "$DATA/uniopc/state/*/workspace/**",
+          "$DATA/uniopc/state-v8/**/media/**",
+          "$DATA/uniopc/state-v8/**/workspace/**",
+          "$DATA/uniopc/workspaces/**",
+          "$DATA/uniopc/state/*/tmp/uniopc-superip/**",
+          "$DATA/uniopc/employees/**"
+        ]
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "createUpdaterArtifacts": true,
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": {
+      "resources/uniopc-engine-runtime": "uniopc-engine-runtime",
+      "resources/plugins/uniopc/uniopc-local-workspace": "plugins/uniopc/uniopc-local-workspace",
+      "resources/plugins/uniopc/uniopc-documents": "plugins/uniopc/uniopc-documents",
+      "resources/plugins/uniopc/uniopc-presentations": "plugins/uniopc/uniopc-presentations"
+    },
+    "macOS": {
+      "signingIdentity": "Developer ID Application: Blue Feather (Xiamen) Technology Co., Ltd. (75JMV28RR9)",
+      "entitlements": "Entitlements.plist"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDgwREVGRDA0NjBFMzdFRTMKUldUamZ1TmdCUDNlZ01GYXRCSlMyTTQ1NFlHb0dFTWNQSTJ0SGYwMWFkTndlME5Ba2ppQ2NxYUwK",
+      "endpoints": [
+        "https://spb-bp1f48p09a51z42o.supabase.opentrust.net/storage/v1/object/public/desktop-releases/imai-desktop/stable/{{target}}/{{arch}}/latest.json"
+      ]
+    }
+  }
+}

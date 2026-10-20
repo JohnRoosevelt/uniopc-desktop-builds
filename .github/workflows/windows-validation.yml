@@ -1,0 +1,46 @@
+name: Windows validation build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-validation:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Install Windows Perl for OpenSSL
+        shell: pwsh
+        run: |
+          $perl = 'C:\Strawberry\perl\bin\perl.exe'
+          if (-not (Test-Path $perl)) { choco install strawberryperl --no-progress --yes }
+          & $perl -MLocale::Maketext::Simple -e 'print "Perl ready\n"'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Add-Content -Path $env:GITHUB_PATH -Value 'C:\Strawberry\perl\bin'
+      - run: npm ci --legacy-peer-deps
+      - name: Check Windows updater public key
+        run: node scripts/check-updater-signing-keys.mjs --platforms windows
+      - name: Check consistent application versions
+        run: node --input-type=module -e 'import { readDesktopReleaseVersion } from "./scripts/prepare-desktop-updater-release.mjs"; console.log(await readDesktopReleaseVersion())'
+      - name: Test validation build safeguards
+        run: node --test scripts/build-desktop-validation.test.mjs
+      - name: Build unsigned Windows x64 validation installer
+        run: npm run build:validation -- --target x86_64-pc-windows-msvc
+      - name: Upload validation installer and evidence
+        uses: actions/upload-artifact@v4
+        with:
+          retention-days: 1
+          name: validation-only-x86_64-pc-windows-msvc
+          if-no-files-found: error
+          path: |
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle
+            dist/release-artifacts/build-validation.json

@@ -1,0 +1,10 @@
+**
+!scripts/
+!scripts/audit-openclaw-plugin.mjs
+!scripts/verify-openclaw-release-contract.mjs
+!scripts/openclaw-plugin-audit-worker.lock.json
+!scripts/openclaw-plugin-audit-worker/
+!scripts/openclaw-plugin-audit-worker/Containerfile
+!scripts/openclaw-plugin-audit-worker/entrypoint.mjs
+!scripts/openclaw-plugin-audit-worker/package.json
+!scripts/openclaw-plugin-audit-worker/package-lock.json

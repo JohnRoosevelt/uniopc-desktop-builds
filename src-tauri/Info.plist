@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>Uniopc needs Automation permission to control Terminal and other apps when an AI employee runs local actions.</string>
+  <key>NSCameraUsageDescription</key>
+  <string>Uniopc can capture photos and video from the camera when requested by an authorized AI employee.</string>
+  <key>NSLocationUsageDescription</key>
+  <string>Uniopc can share this Mac's location when requested by an authorized AI employee.</string>
+  <key>NSLocationWhenInUseUsageDescription</key>
+  <string>Uniopc can share this Mac's location when requested by an authorized AI employee.</string>
+  <key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+  <string>Uniopc can share this Mac's location when requested by an authorized AI employee.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Uniopc needs the microphone for voice input, Voice Wake, and agent audio capture.</string>
+  <key>NSSpeechRecognitionUsageDescription</key>
+  <string>Uniopc uses speech recognition to transcribe voice input and Voice Wake trigger phrases.</string>
+</dict>
+</plist>

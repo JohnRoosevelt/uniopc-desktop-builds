@@ -1,0 +1,11 @@
+{
+  "agentId": "dev",
+  "files": [
+    { "name": "AGENTS.md", "missing": false, "size": 3926, "updatedAtMs": 1788927036193, "futureFileField": "ignored" },
+    { "name": "SOUL.md", "missing": false, "size": 3632, "updatedAtMs": 1788927036194 },
+    { "name": "USER.md", "missing": false, "size": 593, "updatedAtMs": 1788927036195 },
+    { "name": "BOOTSTRAP.md", "missing": true, "expectedAbsent": false },
+    { "name": "MEMORY.md", "missing": true, "expectedAbsent": true }
+  ],
+  "futureListField": true
+}

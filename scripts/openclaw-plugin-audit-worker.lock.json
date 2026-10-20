@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "protocol": {
+    "id": "uniopc-openclaw-plugin-audit",
+    "version": 1,
+    "reportSchemaVersion": 1
+  },
+  "workers": [
+    {
+      "platform": "linux/amd64",
+      "status": "available",
+      "image": "ghcr.io/0xbootiful/uniopc-openclaw-audit-worker@sha256:3762487a6278ec6da74e1c2ae0c171b23ae2ce72018867186c4b4453ab06f57c"
+    },
+    {
+      "platform": "linux/arm64",
+      "status": "available",
+      "image": "ghcr.io/0xbootiful/uniopc-openclaw-audit-worker@sha256:3762487a6278ec6da74e1c2ae0c171b23ae2ce72018867186c4b4453ab06f57c"
+    }
+  ]
+}

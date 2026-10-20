@@ -1,0 +1,54 @@
+{
+  "ts": 1788927144000,
+  "count": 4,
+  "totalCount": 4,
+  "nextOffset": null,
+  "hasMore": false,
+  "sessions": [
+    {
+      "key": "agent:dev:main",
+      "kind": "direct",
+      "classification": "main",
+      "agentId": "dev",
+      "isMain": true,
+      "isBackground": false,
+      "label": "Main fixture",
+      "sessionId": "11111111-1111-1111-1111-111111111111",
+      "createdAt": 1788927000000,
+      "updatedAt": 1788927100000,
+      "thinkingDefault": "medium",
+      "thinkingLevels": [{ "id": "low", "label": "Low" }],
+      "futureSessionField": "ignored"
+    },
+    {
+      "key": "agent:dev:cron:fixture",
+      "kind": "direct",
+      "classification": "cron",
+      "agentId": "dev",
+      "isMain": false,
+      "isBackground": true,
+      "createdVia": "cron",
+      "label": "Cron fixture"
+    },
+    {
+      "key": "agent:dev:subagent:fixture",
+      "kind": "direct",
+      "classification": "subagent",
+      "agentId": "dev",
+      "isMain": false,
+      "isBackground": true,
+      "parentSessionKey": "agent:dev:main",
+      "label": "Worker fixture"
+    },
+    {
+      "key": "agent:dev:conversation:fixture",
+      "kind": "direct",
+      "classification": "custom",
+      "agentId": "dev",
+      "isMain": false,
+      "isBackground": false,
+      "label": "Interactive fixture"
+    }
+  ],
+  "futureResponseField": "ignored"
+}

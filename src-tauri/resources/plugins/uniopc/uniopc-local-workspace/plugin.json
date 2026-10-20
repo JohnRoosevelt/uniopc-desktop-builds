@@ -1,0 +1,13 @@
+{
+  "name": "uniopc-local-workspace",
+  "displayName": "本地工作区",
+  "version": "0.1.3",
+  "description": "The active Uniopc workspace: lets AI employees list, read, create, and update documents stored only in the local desktop profile. Cloud projects, tasks, and cloud documents are retired.",
+  "author": "Uniopc",
+  "category": "workspace",
+  "tags": [
+    "documents",
+    "local-first",
+    "workspace"
+  ]
+}

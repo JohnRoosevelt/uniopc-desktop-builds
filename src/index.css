@@ -1,0 +1,816 @@
+@import "tailwindcss";
+
+/* ═══════════════════════════════════════════════════════════════════
+   设计系统 v3 — token 底座
+
+   分三层，不要混：
+     1. 原始值层  :root / [data-theme]  —— 每个主题一套具体色值
+     2. 语义层    @theme inline         —— 暴露给 Tailwind，生成 utility
+     3. 组件层    lib/theme.js          —— 只允许引用第 2 层生成的 utility
+
+   关键：用 `@theme inline` 而非 `@theme`。inline 会把变量引用直接写进
+   utility（`.bg-surface-raised { background-color: var(--ui-surface-raised) }`），
+   所以切 [data-theme] 重绑原始值即可换肤 —— 不需要任何覆写选择器。
+
+   P1 已把全部 521 处 [var(--ui-color-*)] 任意值换成语义 utility，
+   兼容别名层已删除 —— 现在只有一套名字。
+   ═══════════════════════════════════════════════════════════════════ */
+
+@custom-variant light (&:where([data-theme='light'], [data-theme='light'] *));
+
+/* ── 1. 原始值：深色（默认） ────────────────────────────────────────
+   冷中性偏紫，与品牌 #8b31f5 同色温 —— 修掉旧版 stone 暖灰基底
+   与 slate 冷灰文字、violet 品牌三套色温并存的问题。
+   阶梯方向统一：越"高"越亮，sunken < base < raised < overlay < float。 */
+/* 选择器不限定 :root —— 自定义属性会继承，所以任何元素都能挂
+   data-theme 造一座"岛"。登录页就是一座永久深色岛：它不再硬涂颜色，
+   而是声明 data-theme="dark"，内部所有 token 自然解析成深色值。 */
+:root,
+[data-theme='dark'] {
+  --ui-surface-sunken:  #0a090d;   /* 输入框、代码块等凹陷面 */
+  --ui-surface-base:    #0d0c11;   /* 窗口底 / chrome */
+  --ui-surface-raised:  #141319;   /* 侧边栏、卡片 */
+  --ui-surface-overlay: #1c1a23;   /* 菜单、hover、卡片上的按钮 */
+  --ui-surface-float:   #23202b;   /* 模态、tooltip、抽屉 */
+
+  --ui-border-subtle:   rgba(255, 255, 255, 0.06);
+  --ui-border-default:  rgba(255, 255, 255, 0.10);
+  --ui-border-strong:   rgba(255, 255, 255, 0.16);
+
+  --ui-text-primary:    #f4f3f7;
+  --ui-text-secondary:  #a9a5b8;
+  --ui-text-tertiary:   #75717f;
+
+  --ui-state-hover:     rgba(255, 255, 255, 0.05);
+  --ui-state-active:    rgba(255, 255, 255, 0.08);
+  --ui-state-selected:  rgba(139, 49, 245, 0.14);
+
+  /* 生成头像的饱和度/明度对（色相由名字哈希单独注入） */
+  --ui-avatar-fill:   42% 24%;
+  --ui-avatar-ink:    72% 80%;
+  --ui-avatar-edge:   40% 36%;
+
+  /* 深色下叠一条内高光 —— 这是"有质感"和"像灰卡片"的分水岭，成本极低。
+     浅色下置空，因为浅色靠阴影而非高光区分层级。 */
+  --ui-highlight-inset: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+
+  --ui-shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.40);
+  --ui-shadow-sm: 0 2px 4px rgba(0, 0, 0, 0.40), 0 1px 2px rgba(0, 0, 0, 0.30);
+  --ui-shadow-md: 0 4px 12px -2px rgba(0, 0, 0, 0.50), 0 2px 4px -1px rgba(0, 0, 0, 0.35);
+  --ui-shadow-lg: 0 12px 28px -6px rgba(0, 0, 0, 0.60), 0 4px 10px -3px rgba(0, 0, 0, 0.40);
+  --ui-shadow-xl: 0 24px 56px -12px rgba(0, 0, 0, 0.70), 0 8px 20px -6px rgba(0, 0, 0, 0.45);
+
+  --ui-accent-text:        #d8b4fe;
+  --ui-accent-text-strong: #f3e8ff;
+  --ui-success-text:       #86efac;
+  --ui-warning-text:       #fcd34d;
+  --ui-danger-text:        #fda4af;
+  --ui-info-text:          #93c5fd;
+  --ui-success-surface:    rgba(34, 197, 94, 0.12);
+  --ui-warning-surface:    rgba(245, 158, 11, 0.12);
+  --ui-danger-surface:     rgba(244, 63, 94, 0.12);
+  --ui-info-surface:       rgba(59, 130, 246, 0.12);
+
+  /* 登录页氛围层。登录页跟随主题（不是深色岛）—— 但它的品牌氛围
+     必须两套都成立，否则浅色下深色晕染会糊成一片脏灰。 */
+  --ui-auth-wash: linear-gradient(135deg, rgba(139, 49, 245, 0.14), transparent 32%, rgba(176, 108, 255, 0.08) 72%, transparent),
+                  linear-gradient(90deg, rgba(36, 20, 68, 0.80), rgba(10, 7, 19, 0.20) 44%, rgba(10, 7, 19, 0.92));
+  --ui-auth-vignette: linear-gradient(180deg, rgba(7, 11, 22, 0.08), rgba(7, 11, 22, 0.58) 72%, rgba(7, 11, 22, 0.88));
+  --ui-auth-grid:     rgba(176, 108, 255, 0.06);
+  --ui-auth-hairline: rgba(196, 152, 255, 0.45);
+}
+
+/* ── 1b. 原始值：浅色 ──────────────────────────────────────────────
+   浅色的层级不能靠亮度（白之上没有更白），必须靠阴影 ——
+   这正是当前浅色最破的地方：实测全屏零阴影 + 最高频边框色是纯白。 */
+[data-theme='light'] {
+  --ui-surface-sunken:  #f4f4f7;
+  --ui-surface-base:    #fbfbfd;
+  --ui-surface-raised:  #ffffff;
+  --ui-surface-overlay: #ffffff;
+  --ui-surface-float:   #ffffff;
+
+  /* 浅色的描边 alpha 必须高于深色的对应档 —— 深色面上加白比浅色面上加黑
+     更容易被看见，同样的 0.10 在浅色下几乎隐形（输入框会读成一块灰方块）。 */
+  --ui-border-subtle:   rgba(16, 14, 23, 0.08);
+  --ui-border-default:  rgba(16, 14, 23, 0.14);
+  --ui-border-strong:   rgba(16, 14, 23, 0.22);
+
+  --ui-text-primary:    #16141c;
+  --ui-text-secondary:  #4a4658;
+  --ui-text-tertiary:   #7a7688;
+
+  --ui-state-hover:     rgba(16, 14, 23, 0.04);
+  --ui-state-active:    rgba(16, 14, 23, 0.07);
+  --ui-state-selected:  rgba(139, 49, 245, 0.10);
+
+  --ui-avatar-fill:   74% 88%;
+  --ui-avatar-ink:    58% 30%;
+  --ui-avatar-edge:   45% 78%;
+
+  --ui-highlight-inset: inset 0 1px 0 rgba(255, 255, 255, 0);
+
+  --ui-shadow-xs: 0 1px 2px rgba(16, 14, 23, 0.05);
+  --ui-shadow-sm: 0 1px 3px rgba(16, 14, 23, 0.08), 0 1px 2px rgba(16, 14, 23, 0.04);
+  --ui-shadow-md: 0 4px 12px -2px rgba(16, 14, 23, 0.10), 0 2px 4px -1px rgba(16, 14, 23, 0.06);
+  --ui-shadow-lg: 0 12px 28px -6px rgba(16, 14, 23, 0.14), 0 4px 10px -3px rgba(16, 14, 23, 0.08);
+  --ui-shadow-xl: 0 24px 56px -12px rgba(16, 14, 23, 0.18), 0 8px 20px -6px rgba(16, 14, 23, 0.10);
+
+  --ui-accent-text:        #6d28d9;
+  --ui-accent-text-strong: #5b21b6;
+  --ui-success-text:       #047857;
+  --ui-warning-text:       #a16207;
+  --ui-danger-text:        #be123c;
+  --ui-info-text:          #1d4ed8;
+  --ui-success-surface:    rgba(4, 120, 87, 0.10);
+  --ui-warning-surface:    rgba(161, 98, 7, 0.10);
+  --ui-danger-surface:     rgba(190, 18, 60, 0.10);
+  --ui-info-surface:       rgba(29, 78, 216, 0.10);
+
+  /* 浅色版氛围：克制得多。整页保持近白，只在左上角留一团品牌晕染，
+     右下角压一点冷灰让白色卡片能浮出来。
+     第一版把整个左半边铺成薰衣草色 —— 太甜、也太重，不是"精致"是"糖果"。 */
+  --ui-auth-wash: radial-gradient(120% 85% at 10% 6%, rgba(139, 49, 245, 0.10), transparent 52%),
+                  radial-gradient(90% 70% at 96% 96%, rgba(139, 49, 245, 0.05), transparent 60%);
+  --ui-auth-vignette: linear-gradient(180deg, rgba(16, 14, 23, 0), rgba(16, 14, 23, 0.02) 74%, rgba(16, 14, 23, 0.05));
+  --ui-auth-grid:     rgba(139, 49, 245, 0.028);
+  --ui-auth-hairline: rgba(139, 49, 245, 0.22);
+}
+
+/* ── 1c. 主题无关 ──────────────────────────────────────────────── */
+:root {
+  /* 品牌 —— 独角兽紫，与小程序 (--accent #8b31f5) 和 web 落地页共用 */
+  --ui-brand:        #8b31f5;
+  --ui-brand-strong: #7322d6;
+  --ui-brand-soft:   #b06cff;
+
+  /* 焦点环用品牌色：键盘可达性不该随主题变弱 */
+  --ui-focus-ring:   rgba(139, 49, 245, 0.5);
+
+  /* 遮罩：模态/抽屉背后的压暗层。两个主题都必须是暗的 ——
+     浅色下用浅色遮罩等于没有遮罩，这是主题无关的。 */
+  --ui-scrim:        rgba(10, 9, 13, 0.55);
+  --ui-scrim-strong: rgba(10, 9, 13, 0.72);
+
+  /* 动效：此前完全缺失，全仓靠 transition-all + 默认 150ms 缓动 */
+  --ui-ease-out:      cubic-bezier(0.16, 1, 0.3, 1);
+  --ui-ease-in-out:   cubic-bezier(0.65, 0, 0.35, 1);
+  --ui-duration-fast: 120ms;  /* hover / press */
+  --ui-duration-base: 200ms;  /* 展开 / 淡入 */
+  --ui-duration-slow: 320ms;  /* 抽屉 / 模态 */
+
+  /* 层级：此前无刻度，各处手写 z-50 / z-[999] */
+  --ui-z-base:     0;
+  --ui-z-sticky:   10;
+  --ui-z-dropdown: 20;
+  --ui-z-drawer:   30;
+  --ui-z-modal:    40;
+  --ui-z-toast:    50;
+  --ui-z-tooltip:  60;
+}
+
+/* ── 2. 语义层：暴露给 Tailwind ──────────────────────────────────
+   生成 bg-surface-raised / border-subtle / text-secondary /
+   shadow-md / ease-out / duration-base 等 utility。
+   写对比写错更省事 —— 这是整个改造的支点。 */
+@theme inline {
+  --color-surface-sunken:  var(--ui-surface-sunken);
+  --color-surface-base:    var(--ui-surface-base);
+  --color-surface-raised:  var(--ui-surface-raised);
+  --color-surface-overlay: var(--ui-surface-overlay);
+  --color-surface-float:   var(--ui-surface-float);
+
+  --color-subtle:  var(--ui-border-subtle);
+  --color-default: var(--ui-border-default);
+  --color-strong:  var(--ui-border-strong);
+
+  --color-primary:   var(--ui-text-primary);
+  --color-secondary: var(--ui-text-secondary);
+  --color-tertiary:  var(--ui-text-tertiary);
+
+  --color-brand:        var(--ui-brand);
+  --color-brand-strong: var(--ui-brand-strong);
+  --color-brand-soft:   var(--ui-brand-soft);
+
+  --color-state-hover:    var(--ui-state-hover);
+  --color-state-active:   var(--ui-state-active);
+  --color-state-selected: var(--ui-state-selected);
+
+  --color-accent-text:        var(--ui-accent-text);
+  --color-accent-text-strong: var(--ui-accent-text-strong);
+  --color-success-text:       var(--ui-success-text);
+  --color-warning-text:       var(--ui-warning-text);
+  --color-danger-text:        var(--ui-danger-text);
+  --color-info-text:          var(--ui-info-text);
+  --color-success-surface:    var(--ui-success-surface);
+  --color-warning-surface:    var(--ui-warning-surface);
+  --color-danger-surface:     var(--ui-danger-surface);
+  --color-info-surface:       var(--ui-info-surface);
+
+  --color-scrim:        var(--ui-scrim);
+  --color-scrim-strong: var(--ui-scrim-strong);
+
+  --shadow-xs: var(--ui-shadow-xs);
+  --shadow-sm: var(--ui-shadow-sm);
+  --shadow-md: var(--ui-shadow-md);
+  --shadow-lg: var(--ui-shadow-lg);
+  --shadow-xl: var(--ui-shadow-xl);
+
+  --ease-out:    var(--ui-ease-out);
+  --ease-in-out: var(--ui-ease-in-out);
+
+  /* ── 排版刻度 ────────────────────────────────────────────────────
+     实测桌面端排版是最大的一笔债：893 个排版点，其中 415 个硬编码
+     text-[Npx] 横跨 18 个字号，而 11/12/13px 三个相邻档就占了 76% ——
+     它们视觉上分不出来却互相竞争，这正是"没有秩序感"的直接来源。
+     另有 138 处根本没设字号、继承浏览器默认的 16px（那是 bug 不是设计）。
+
+     收敛到 8 档，其中 body 区间只有 11/12/13/14/16 五档。
+     字越大行高越紧、字距越收 —— 大字不需要那么多喘息空间。 */
+  --text-2xs: 11px;   /* 角标、计数 */
+  --text-2xs--line-height: 1.45;
+  --text-xs: 12px;    /* 辅助信息、时间戳 */
+  --text-xs--line-height: 1.5;
+  --text-sm: 13px;    /* 密集列表、次要正文 —— 桌面主力 */
+  --text-sm--line-height: 1.55;
+  --text-base: 14px;  /* 正文、消息内容 */
+  --text-base--line-height: 1.6;
+  --text-lg: 16px;    /* 区块标题 */
+  --text-lg--line-height: 1.45;
+  --text-xl: 18px;    /* 页面标题 */
+  --text-xl--line-height: 1.35;
+  --text-xl--letter-spacing: -0.01em;
+  --text-2xl: 22px;   /* 空状态主标题 */
+  --text-2xl--line-height: 1.25;
+  --text-2xl--letter-spacing: -0.02em;
+  --text-3xl: 28px;
+  --text-3xl--line-height: 1.2;
+  --text-3xl--letter-spacing: -0.02em;
+}
+
+/* ── 排版刻度 ──────────────────────────────────────────────────────
+   保留现状。字号收敛（10 档 → 6 档、408 处 text-[Npx]）与圆角收敛
+   放在 P2 —— 覆盖 Tailwind 默认的 text-sm / rounded-lg 会一次性改动
+   所有页面，必须逐页复核，不该混进 P0。 */
+:root {
+  /* 与 @theme 的 --text-* 刻度保持一致。.ui-text-* 工具类走这套变量，
+     两套刻度并存会各说各话。 */
+  --ui-font-size-xs: 12px;
+  --ui-font-size-sm: 13px;
+  --ui-font-size-base: 14px;
+  --ui-font-size-lg: 16px;
+  --ui-font-size-xl: 18px;
+  /* Display tier — the hierarchy the old 12–20px scale was missing. */
+  --ui-font-size-2xl: 22px;
+  --ui-font-size-3xl: 28px;
+  --ui-font-size-4xl: 38px;
+
+  /* Weights, line-heights, tracking — so hierarchy comes from a system,
+     not per-element guesses. */
+  --ui-font-weight-normal: 400;
+  --ui-font-weight-medium: 500;
+  --ui-font-weight-semibold: 600;
+  --ui-leading-tight: 1.2;
+  --ui-leading-snug: 1.35;
+  --ui-leading-normal: 1.55;
+  --ui-tracking-tight: -0.02em;
+  --ui-tracking-normal: 0;
+  --ui-tracking-wide: 0.04em;
+  --ui-tracking-wider: 0.12em;
+
+  /* Display face for headings. Defaults to the system stack so nothing
+     shifts until a real display typeface is chosen — swap this one value. */
+  --ui-font-display: -apple-system, BlinkMacSystemFont, "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+
+  --ui-spacing-xs: 4px;
+  --ui-spacing-sm: 8px;
+  --ui-spacing-md: 12px;
+  --ui-spacing-lg: 16px;
+  --ui-spacing-xl: 18px;
+  --ui-spacing-2xl: 22px;
+
+  --ui-radius-sm: 8px;
+  --ui-radius-md: 10px;
+  --ui-radius-lg: 12px;
+  --ui-radius-xl: 14px;
+}
+
+/* Smooth font rendering + system font stack for CJK */
+html {
+  /* 桌面端主力字号是 13px，不是浏览器默认的 16px。
+     此前实测 16px 出现 138 次 —— 那是"没设字号所以继承"的结果，
+     不是有人选的。在根上定基准，未标注的文本落在正确的档位上。 */
+  font-size: 13px;
+}
+
+html, body {
+  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB",
+               "Microsoft YaHei", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  font-feature-settings: "cv11";
+  background: var(--ui-surface-base);
+  color: var(--ui-text-primary);
+}
+
+body {
+  margin: 0;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+/* Desktop chrome is not a document. Keep intentional content/editing copyable. */
+body {
+  -webkit-user-select: none;
+  user-select: none;
+}
+input, textarea, [contenteditable]:not([contenteditable="false"]),
+.conversation-markdown, .uniopc-blocksuite-editor, pre, code, .select-text, [data-selectable] {
+  -webkit-user-select: text;
+  user-select: text;
+}
+[data-tauri-drag-region], button, nav {
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+@keyframes ui-rise-fade {
+  0% {
+    opacity: 0;
+    transform: translateY(6px) scale(0.98);
+  }
+  18% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(-12px) scale(1.04);
+  }
+}
+
+.ui-rise-fade {
+  animation: ui-rise-fade 1.2s ease-out forwards;
+}
+
+/* ── Elevation ────────────────────────────────────────────────────
+   一档一个用途，不要跳档。深色额外叠内高光（--ui-highlight-inset），
+   浅色下该变量为空，靠阴影本身区分层级。
+   此前全仓实测零真实阴影，界面完全扁平 —— 这是补的第一课。 */
+.ui-elevation-flat    { box-shadow: var(--ui-highlight-inset); }
+.ui-elevation-raised  { box-shadow: var(--ui-highlight-inset), var(--ui-shadow-sm); }
+.ui-elevation-overlay { box-shadow: var(--ui-highlight-inset), var(--ui-shadow-md); }
+.ui-elevation-float   { box-shadow: var(--ui-highlight-inset), var(--ui-shadow-lg); }
+.ui-elevation-modal   { box-shadow: var(--ui-highlight-inset), var(--ui-shadow-xl); }
+
+/* ── 头像与在场状态 ──────────────────────────────────────────────
+   生成头像：色相由名字哈希注入 --ui-avatar-hue，饱和度/明度走主题 token，
+   所以同一个人在深浅两套下都是"同一个颜色"，只是深浅不同。 */
+.ui-avatar-generated {
+  background: hsl(var(--ui-avatar-hue, 268) var(--ui-avatar-fill));
+  color: hsl(var(--ui-avatar-hue, 268) var(--ui-avatar-ink));
+  border: 1px solid hsl(var(--ui-avatar-hue, 268) var(--ui-avatar-edge));
+}
+
+/* Signature：AI 员工的"脉冲"。
+   此前在场状态是头像右下角一个绿点 —— 实测它是全屏出现最多的彩色（9 次），
+   比品牌紫（1 次）还抢眼，等于让一个次要状态主导了整个界面的色彩印象。
+   改成头像外圈的品牌色呼吸环：位置上依附于"谁"，而不是抢一个独立的视觉位。
+   全产品只在这里允许动效，其余一律克制。 */
+@keyframes ui-presence-breathe {
+  0%, 100% { opacity: 0.85; transform: scale(1); }
+  50%      { opacity: 0.35; transform: scale(1.08); }
+}
+
+.ui-presence {
+  position: absolute;
+  inset: -2px;
+  border-radius: inherit;
+  pointer-events: none;
+  border: 1.5px solid transparent;
+}
+
+.ui-presence-active {
+  border-color: var(--ui-brand);
+  animation: ui-presence-breathe 2.4s var(--ui-ease-in-out) infinite;
+}
+
+.ui-presence-pending { border-color: var(--ui-warning-text); }
+.ui-presence-failed  { border-color: var(--ui-danger-text); }
+.ui-presence-idle    { border-color: var(--ui-border-strong); }
+
+@media (prefers-reduced-motion: reduce) {
+  .ui-presence-active { animation: none; opacity: 0.85; }
+}
+
+.ui-panel {
+  background: var(--ui-surface-raised);
+  border: 1px solid var(--ui-border-subtle);
+  border-radius: var(--ui-radius-xl);
+  box-shadow: var(--ui-highlight-inset), var(--ui-shadow-sm);
+  color: var(--ui-text-primary);
+}
+
+/* ── 这里曾经有 98 条 :root[data-theme='light'] 覆写选择器 ──────────
+   它们逐个追杀硬编码的深色类（.bg-[#2b2827] / .text-white /
+   .border-white/8 …），因为那些类天生只对深色成立，浅色下必须抢救。
+
+   代价是：任何人新写组件用了硬编码深色类，浅色模式就静默破一处，
+   没有任何报错 —— 精致度因此不可能收敛。
+
+   现在颜色全部走 @theme inline 的语义 token，切 [data-theme] 重绑
+   原始值即可换肤，这一整层补丁不再需要，已删除。
+   守卫见 lib/designTokens.test.mjs。 */
+
+.ui-panel-soft {
+  background: var(--ui-surface-overlay);
+  border: 1px solid var(--ui-border-subtle);
+  border-radius: var(--ui-radius-lg);
+  box-shadow: var(--ui-highlight-inset);
+  color: var(--ui-text-primary);
+}
+
+.ui-modal {
+  background: var(--ui-surface-float);
+  border: 1px solid var(--ui-border-default);
+  border-radius: var(--ui-radius-xl);
+  box-shadow: var(--ui-highlight-inset), var(--ui-shadow-xl);
+  color: var(--ui-text-primary);
+}
+
+.ui-input {
+  width: 100%;
+  background: var(--ui-surface-sunken);
+  border: 1px solid var(--ui-border-default);
+  border-radius: var(--ui-radius-md);
+  color: var(--ui-text-primary);
+  /* 用 px 而非 rem：根基准是 13px，rem 会让内边距跟着字号一起缩 */
+  padding: 9px 12px;
+  font-size: var(--ui-font-size-sm);
+  transition: box-shadow var(--ui-duration-base) var(--ui-ease-out),
+              border-color var(--ui-duration-base) var(--ui-ease-out),
+              background-color var(--ui-duration-base) var(--ui-ease-out);
+}
+
+.ui-input::placeholder {
+  color: var(--ui-text-tertiary);
+}
+
+.ui-input:hover {
+  border-color: var(--ui-border-strong);
+}
+
+.ui-input:focus {
+  outline: none;
+  border-color: transparent;
+  box-shadow: 0 0 0 2px var(--ui-focus-ring);
+}
+
+/* ── Typography scale ─────────────────────────────────── */
+/* One class per role; bundles size + weight + line-height + tracking so
+   every heading/label reads as part of one system. Color stays separate
+   (compose with text color utilities/tokens). */
+.ui-text-display {
+  font-family: var(--ui-font-display);
+  font-size: var(--ui-font-size-4xl);
+  font-weight: var(--ui-font-weight-semibold);
+  line-height: var(--ui-leading-tight);
+  letter-spacing: var(--ui-tracking-tight);
+}
+.ui-text-h1 {
+  font-family: var(--ui-font-display);
+  font-size: var(--ui-font-size-3xl);
+  font-weight: var(--ui-font-weight-semibold);
+  line-height: var(--ui-leading-tight);
+  letter-spacing: var(--ui-tracking-tight);
+}
+.ui-text-h2 {
+  font-size: var(--ui-font-size-2xl);
+  font-weight: var(--ui-font-weight-semibold);
+  line-height: var(--ui-leading-snug);
+  letter-spacing: var(--ui-tracking-tight);
+}
+.ui-text-h3 {
+  font-size: var(--ui-font-size-xl);
+  font-weight: var(--ui-font-weight-semibold);
+  line-height: var(--ui-leading-snug);
+}
+.ui-text-title {
+  font-size: var(--ui-font-size-lg);
+  font-weight: var(--ui-font-weight-semibold);
+  line-height: var(--ui-leading-snug);
+}
+.ui-text-body {
+  font-size: var(--ui-font-size-base);
+  font-weight: var(--ui-font-weight-normal);
+  line-height: var(--ui-leading-normal);
+}
+.ui-text-body-sm {
+  font-size: var(--ui-font-size-sm);
+  font-weight: var(--ui-font-weight-normal);
+  line-height: var(--ui-leading-normal);
+}
+.ui-text-caption {
+  font-size: var(--ui-font-size-xs);
+  font-weight: var(--ui-font-weight-medium);
+  line-height: var(--ui-leading-snug);
+}
+.ui-text-eyebrow {
+  font-size: var(--ui-font-size-xs);
+  font-weight: var(--ui-font-weight-semibold);
+  line-height: 1;
+  letter-spacing: var(--ui-tracking-wider);
+  text-transform: uppercase;
+}
+
+/* ── Scrollbar refinement ─────────────────────────────── */
+/* Default: invisible. Appears on hover of container. */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 8px;
+  transition: background 0.2s;
+}
+*:hover > ::-webkit-scrollbar-thumb,
+*:hover::-webkit-scrollbar-thumb {
+  background: rgb(120 113 108 / 0.45);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgb(168 162 158 / 0.6);
+}
+
+::selection {
+  background: rgb(139 49 245 / 0.35);
+  color: #ffffff;
+}
+
+/* ── Animations ───────────────────────────────────────── */
+/* Accessibility floor: honor the OS "reduce motion" setting. Kills the
+   decorative page/enter animations while leaving functional feedback
+   (streaming cursor, thinking dots) as a near-instant state change. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: scale(0.95); }
+  to { opacity: 1; transform: scale(1); }
+}
+
+@keyframes slideIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.animate-fadeIn {
+  animation: fadeIn 0.2s ease-out;
+}
+
+.animate-slideIn {
+  animation: slideIn 0.15s ease-out;
+}
+
+@keyframes fadeInUp {
+  from { opacity: 0; transform: translateY(20px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.animate-fadeInUp {
+  animation: fadeInUp 0.6s ease-out forwards;
+}
+
+@keyframes conversationThinkingDot {
+  0%, 80%, 100% {
+    transform: translateY(0);
+    opacity: 0.45;
+  }
+  40% {
+    transform: translateY(-3px);
+    opacity: 1;
+  }
+}
+
+.conversation-thinking-indicator {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 1px;
+}
+
+.conversation-thinking-dots {
+  display: inline-flex;
+  margin-left: 1px;
+}
+
+.conversation-thinking-dot {
+  display: inline-block;
+  animation: conversationThinkingDot 1s ease-in-out infinite;
+}
+
+.conversation-thinking-dot:nth-child(2) {
+  animation-delay: 0.16s;
+}
+
+.conversation-thinking-dot:nth-child(3) {
+  animation-delay: 0.32s;
+}
+
+/* ── Conversation markdown body ───────────────────────── */
+/* The bubble container keeps whitespace-pre-wrap for legacy plain-text
+   messages; markdown supplies its own block spacing, so reset inside. */
+.conversation-markdown {
+  white-space: normal;
+}
+
+.conversation-markdown > :first-child,
+.conversation-markdown > div > :first-child {
+  margin-top: 0;
+}
+
+.conversation-markdown > :last-child,
+.conversation-markdown > div > :last-child {
+  margin-bottom: 0;
+}
+
+.conversation-markdown p,
+.conversation-markdown ul,
+.conversation-markdown ol,
+.conversation-markdown blockquote {
+  margin: 0.5em 0;
+}
+
+.conversation-markdown h1,
+.conversation-markdown h2,
+.conversation-markdown h3,
+.conversation-markdown h4,
+.conversation-markdown h5,
+.conversation-markdown h6 {
+  margin: 0.9em 0 0.45em;
+  font-weight: 600;
+  line-height: 1.35;
+}
+
+.conversation-markdown h1 { font-size: 1.25em; }
+.conversation-markdown h2 { font-size: 1.15em; }
+.conversation-markdown h3 { font-size: 1.06em; }
+.conversation-markdown h4,
+.conversation-markdown h5,
+.conversation-markdown h6 { font-size: 1em; }
+
+.conversation-markdown ul,
+.conversation-markdown ol {
+  padding-left: 1.4em;
+}
+
+.conversation-markdown ul { list-style: disc; }
+.conversation-markdown ul ul { list-style: circle; }
+.conversation-markdown ul ul ul { list-style: square; }
+.conversation-markdown ol { list-style: decimal; }
+.conversation-markdown li { margin: 0.2em 0; }
+.conversation-markdown li > p { margin: 0.2em 0; }
+
+.conversation-markdown blockquote {
+  border-left: 3px solid rgba(176, 108, 255, 0.4);
+  padding-left: 0.9em;
+  color: rgba(214, 211, 209, 0.85);
+}
+
+.conversation-markdown hr {
+  margin: 0.9em 0;
+  border: 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.conversation-markdown table {
+  border-collapse: collapse;
+  font-size: 0.95em;
+}
+
+.conversation-markdown th,
+.conversation-markdown td {
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  padding: 0.35em 0.7em;
+  text-align: left;
+}
+
+.conversation-markdown th {
+  background: rgba(255, 255, 255, 0.05);
+  font-weight: 600;
+}
+
+.conversation-markdown pre code {
+  display: block;
+  background: transparent;
+  padding: 0;
+  color: inherit;
+}
+
+/* Streaming cursor: a blinking ▍ pinned to the tail of whatever element the
+   model is currently writing into (Accio-style, pure CSS). */
+@keyframes conversationStreamingCursorBlink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+.conversation-streaming-cursor > :last-child::after {
+  content: '▍';
+  display: inline-block;
+  margin-left: 1px;
+  color: rgb(176, 108, 255);
+  animation: conversationStreamingCursorBlink 1s step-end infinite;
+}
+
+/* ── Project task board ───────────────────────────────── */
+/* 状态色只做顶部一抹晕染，列底一律是同一个 surface —— 让"哪一列"
+   靠色相区分，而不是靠亮度，否则五列会读成五个层级。
+   原来这里是 dark/light 各写一遍、共 11 条硬编码规则；
+   *-surface token 本身就是主题感知的，折叠成 6 条。 */
+.task-board-column {
+  background: var(--ui-surface-raised);
+}
+
+.task-board-column-queued {
+  background: var(--ui-surface-raised);
+}
+
+.task-board-column-dispatched {
+  background: linear-gradient(180deg, var(--ui-info-surface), transparent 96px), var(--ui-surface-raised);
+}
+
+.task-board-column-running {
+  background: linear-gradient(180deg, var(--ui-warning-surface), transparent 96px), var(--ui-surface-raised);
+}
+
+.task-board-column-done {
+  background: linear-gradient(180deg, var(--ui-success-surface), transparent 96px), var(--ui-surface-raised);
+}
+
+.task-board-column-failed {
+  background: linear-gradient(180deg, var(--ui-danger-surface), transparent 96px), var(--ui-surface-raised);
+}
+
+/* ── BlockSuite project documents ─────────────────────── */
+.uniopc-blocksuite-editor {
+  min-height: 620px;
+  overflow: hidden;
+  background: var(--ui-surface-raised);
+  color: var(--ui-text-primary);
+  --affine-font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --affine-background-primary-color: var(--ui-surface-raised);
+  --affine-background-secondary-color: var(--ui-surface-raised);
+  --affine-background-tertiary-color: var(--ui-surface-overlay);
+  --affine-background-code-block: var(--ui-surface-raised);
+  --affine-text-primary-color: var(--ui-text-primary);
+  --affine-text-secondary-color: var(--ui-text-secondary);
+  --affine-text-disable-color: var(--ui-text-tertiary);
+  --affine-placeholder-color: var(--ui-text-tertiary);
+  --affine-border-color: var(--ui-border-subtle);
+  --affine-divider-color: var(--ui-border-subtle);
+  --affine-hover-color: var(--ui-state-hover);
+  --affine-icon-color: var(--ui-text-secondary);
+  --affine-icon-secondary: var(--ui-text-tertiary);
+  --affine-primary-color: #1e96eb;
+  --affine-link-color: #1e67af;
+  --affine-editor-width: 100%;
+  --affine-editor-side-padding: 28px;
+}
+
+.uniopc-blocksuite-editor__surface {
+  height: 100%;
+  min-height: 620px;
+  padding: 10px 0 24px;
+}
+
+.uniopc-blocksuite-editor editor-host,
+.uniopc-blocksuite-editor page-editor {
+  display: block;
+  height: 100%;
+  min-height: 620px;
+}
+
+.uniopc-blocksuite-editor .page-editor-container,
+.uniopc-blocksuite-editor .affine-page-viewport {
+  height: 100%;
+  min-height: 620px;
+  background: transparent;
+}
+
+.uniopc-blocksuite-editor.is-readonly editor-host,
+.uniopc-blocksuite-editor.is-readonly page-editor {
+  pointer-events: none;
+}

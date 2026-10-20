@@ -1,0 +1,12 @@
+{
+  "id": "uniopc-documents",
+  "name": "文档处理",
+  "version": "0.1.0",
+  "description": "Create real DOCX files through the authenticated Uniopc desktop document bridge.",
+  "requiredEnv": ["UNIOPC_LOCAL_DOCUMENTS_URL", "UNIOPC_LOCAL_DOCUMENTS_TOKEN", "UNIOPC_OPENCLAW_PROFILE"],
+  "skills": ["./skills"],
+  "configSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+  "activation": { "onStartup": true },
+  "contracts": { "tools": ["uniopc_documents_create_docx"] },
+  "toolMetadata": { "uniopc_documents_create_docx": { "replaySafe": false, "sideEffecting": true } }
+}

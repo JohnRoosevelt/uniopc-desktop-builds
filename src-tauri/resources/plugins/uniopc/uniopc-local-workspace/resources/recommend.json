@@ -1,0 +1,22 @@
+[
+  {
+    "id": "local-document-authoring",
+    "type": "text",
+    "title": "本地文档",
+    "sectionTitle": "本机工作区",
+    "prompts": [
+      {
+        "id": "list-local-documents",
+        "type": "text",
+        "text": "列出我本地工作区中的文档，并说明各文档的更新时间。",
+        "skillId": "local-document-authoring"
+      },
+      {
+        "id": "draft-local-document",
+        "type": "text",
+        "text": "根据以下要点创建一篇本地文档：[粘贴内容]",
+        "skillId": "local-document-authoring"
+      }
+    ]
+  }
+]
