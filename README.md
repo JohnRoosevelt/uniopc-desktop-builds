@@ -27,9 +27,13 @@ node scripts/desktop-release-control.mjs publish --candidate CANDIDATE-ID --comm
 
 ## Runtime cache
 
-Run **Actions → Prepare Windows runtime cache → Run workflow** on **main** before the first candidate. Only the owner can run it; it uses no secrets. The first warm downloads and builds the pinned OpenClaw/Node runtime. Later candidates restore the exact main-branch cache key and avoid that repeated download when inputs are unchanged. A miss builds normally; candidate jobs never write runtime caches or use fallback restore keys.
+The Windows runtime cache warms automatically after owner pushes to `main` that touch runtime builders, runtime dependency locks/pins or cache policy. **Actions → Prepare Windows runtime cache → Run workflow** on **main** remains optional for cache eviction or manual repair. It needs no secrets.
 
-The key includes platform, architecture, OpenClaw and Node pins, every script, package manifests and locks, Cargo files and Rust runtime sources, Tauri configs, bundled plugins and workflows. The cache contains only the Windows runtime archive and catalog. Every hit is checked against its SHA-256, size, release contract and whitelabel rules; corrupt hits fail closed. The release build still verifies and snapshots the prepared runtime before Tauri packaging. GitHub cache eviction can cause a later rebuild; rerun the main warm workflow to replenish it.
+V2 keys cover only the five runtime builder/branding/verifier modules, semantic OpenClaw and Node pins, Windows platform/architecture, the actual `@babel/parser` lockfile dependency closure, and the cache policy/direct-Node build recipe. Application versions, frontend/Rust application edits, signing workflows, Perl fixes, unrelated tests/dependencies and bundled app plugins preserve the key. Relevant runtime changes invalidate it. A hit is restored and fully verified before dependency installation; only a miss installs builder dependencies and downloads/repacks the runtime. Candidate jobs read exact V2 main caches and never write them or use fallback restore keys.
+
+The owner-main warmer can migrate one known V1 cache from source commit `7a708bfcb7999ac36233c80075fa5a21d0519c1e` only when its runtime projection equals the current V2 runtime inputs. It verifies all restored bytes before saving V2. Missing/incompatible seeds build normally; corrupt hits fail closed. Candidate tags never use V1 seeds.
+
+The cache contains only the Windows runtime archive and catalog. Every hit is checked against its SHA-256, size, release contract and whitelabel rules. Release builds still snapshot and verify prepared bytes before Tauri packaging. GitHub cache eviction or genuine runtime-input changes can require another build. **Runtime cache reuse check** runs on owner-pushed `test/runtime-cache/*` tags already on `main`: it requires an exact V2 hit and verifies the runtime without dependency installation, signing or compilation.
 
 ## Unsigned validation
 

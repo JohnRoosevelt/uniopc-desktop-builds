@@ -1,11 +1,26 @@
 name: Prepare Windows runtime cache
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - scripts/build-openclaw-runtime-bundle.mjs
+      - scripts/uniopc-runtime-scopes.mjs
+      - scripts/uniopc-runtime-branding.mjs
+      - scripts/verify-openclaw-release-contract.mjs
+      - scripts/verify-uniopc-whitelabel-runtime.mjs
+      - scripts/windows-runtime-cache.mjs
+      - src-tauri/Cargo.toml
+      - package-lock.json
+      - .github/workflows/prepare-windows-runtime.yml
 permissions:
   contents: read
+concurrency:
+  group: windows-runtime-main-cache
+  cancel-in-progress: false
 jobs:
   prepare:
-    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.repository == 'JohnRoosevelt/uniopc-desktop-builds' && github.actor == 'JohnRoosevelt' && github.triggering_actor == 'JohnRoosevelt'
+    if: (github.event_name == 'workflow_dispatch' || github.event_name == 'push') && github.ref == 'refs/heads/main' && github.repository == 'JohnRoosevelt/uniopc-desktop-builds' && github.actor == 'JohnRoosevelt' && github.triggering_actor == 'JohnRoosevelt'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -17,7 +32,6 @@ jobs:
         with:
           node-version: 22
       - run: node scripts/public-release-guard.mjs warm
-      - run: npm ci --legacy-peer-deps
       - id: runtime-key
         run: node scripts/windows-runtime-cache.mjs key
       - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
@@ -27,10 +41,33 @@ jobs:
           path: |
             src-tauri/resources/uniopc-engine-runtime/uniopc-engine-runtime-win32-x64.tar.gz
             src-tauri/resources/uniopc-engine-runtime/uniopc-engine-runtime.catalog.json
-      - name: Build runtime only on exact cache miss
+      - name: Verify exact V2 cache hit before dependency installation
+        if: steps.runtime-cache.outputs.cache-hit == 'true'
+        run: node scripts/windows-runtime-cache.mjs verify
+      - name: Check one-time trusted V1 seed projection
         if: steps.runtime-cache.outputs.cache-hit != 'true'
-        run: npm run build:openclaw-runtime -- --force --platform win32 --arch x64
-      - name: Verify runtime hash, contract and whitelabel on every hit or build
+        id: seed-key
+        run: node scripts/windows-runtime-cache.mjs seed-key
+      - name: Restore only the compatible owner-main seed
+        if: steps.runtime-cache.outputs.cache-hit != 'true' && steps.seed-key.outputs.key != ''
+        id: legacy-seed
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          key: ${{ steps.seed-key.outputs.key }}
+          path: |
+            src-tauri/resources/uniopc-engine-runtime/uniopc-engine-runtime-win32-x64.tar.gz
+            src-tauri/resources/uniopc-engine-runtime/uniopc-engine-runtime.catalog.json
+      - name: Verify seed bytes before saving V2
+        if: steps.legacy-seed.outputs.cache-hit == 'true'
+        run: node scripts/windows-runtime-cache.mjs verify
+      - name: Install builder dependencies only on a genuine miss
+        if: steps.runtime-cache.outputs.cache-hit != 'true' && steps.legacy-seed.outputs.cache-hit != 'true'
+        run: npm ci --legacy-peer-deps
+      - name: Build runtime only on a genuine miss
+        if: steps.runtime-cache.outputs.cache-hit != 'true' && steps.legacy-seed.outputs.cache-hit != 'true'
+        run: node scripts/windows-runtime-cache.mjs build
+      - name: Verify freshly built runtime hash, contract and whitelabel
+        if: steps.runtime-cache.outputs.cache-hit != 'true' && steps.legacy-seed.outputs.cache-hit != 'true'
         run: node scripts/windows-runtime-cache.mjs verify
       - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
         if: steps.runtime-cache.outputs.cache-hit != 'true'

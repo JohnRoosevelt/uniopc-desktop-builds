@@ -1,42 +1,100 @@
 import assert from 'node:assert/strict'
 import { mkdtemp, mkdir, writeFile, rm, readFile, symlink } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join, dirname } from 'node:path'
+import { join, dirname, resolve } from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import test from 'node:test'
-import { runtimeCacheKey, verifyCachedRuntime, RUNTIME_CACHE_PATHS } from './windows-runtime-cache.mjs'
+import { runtimeCacheKey, runtimeProjection, parserLockClosure, moduleImports, legacySeedKey, verifyCachedRuntime, RUNTIME_CACHE_PATHS, RUNTIME_MODULES, RUNTIME_RECIPE, LEGACY_SEED_KEY } from './windows-runtime-cache.mjs'
 import { OPENCLAW_RELEASE_NODE_VERSION } from './verify-openclaw-release-contract.mjs'
+const sourceRoot = resolve(import.meta.dirname, '..')
 async function fixture(t) {
   const root = await mkdtemp(join(tmpdir(), 'uniopc-cache-'))
   t.after(() => rm(root, { recursive: true, force: true }))
-  const inputs = ['package.json', 'package-lock.json', 'src-tauri/Cargo.lock', 'src-tauri/tauri.conf.json', 'src-tauri/tauri.windows.conf.json', 'scripts/build.mjs', 'scripts/nested/verify.mjs', '.github/workflows/desktop-release.yml', '.github/workflows/prepare-windows-runtime.yml', 'src-tauri/src/runtime.rs', 'src-tauri/resources/plugins/uniopc/plugin/dist/index.js', 'src-tauri/resources/plugins/uniopc/plugin/package-lock.json']
-  for (const file of inputs) { await mkdir(dirname(join(root, file)), { recursive: true }); await writeFile(join(root, file), '{}') }
-  await writeFile(join(root, 'src-tauri/Cargo.toml'), '[package.metadata.uniopc]\nopenclaw-version = "2026.8.1"\n')
-  return { root, inputs: [...inputs, 'src-tauri/Cargo.toml'] }
+  const inputs = [...RUNTIME_MODULES, 'scripts/windows-runtime-cache.mjs', 'src-tauri/Cargo.toml', 'package-lock.json']
+  for (const file of inputs) {
+    await mkdir(dirname(join(root, file)), { recursive: true })
+    await writeFile(join(root, file), await readFile(join(sourceRoot, file)))
+  }
+  return { root, inputs }
 }
-test('content key is deterministic, target/pin-specific and invalidates for every release input', async t => {
-  const { root, inputs } = await fixture(t)
+async function modify(root, file, update, run) {
+  const original = await readFile(join(root, file), 'utf8')
+  await writeFile(join(root, file), update(original))
+  try { await run() } finally { await writeFile(join(root, file), original) }
+}
+test('V2 key is deterministic without installed dependencies; runtime modules, pins and policy invalidate it', async t => {
+  const { root } = await fixture(t)
   const options = { projectRoot: root }
   const key = await runtimeCacheKey(options)
   assert.equal(await runtimeCacheKey(options), key)
-  assert.match(key, /win32-x64-openclaw-2026.8.1-node-24\.19\.0-[a-f0-9]{64}$/)
+  assert.match(key, /^uniopc-runtime-v2-win32-x64-openclaw-2026.8.1-node-24\.19\.0-[a-f0-9]{64}$/)
   assert.notEqual(await runtimeCacheKey({ ...options, platform: 'linux' }), key)
   assert.notEqual(await runtimeCacheKey({ ...options, arch: 'arm64' }), key)
-  for (const file of inputs) {
-    const old = await readFile(join(root, file))
-    await writeFile(join(root, file), Buffer.concat([old, Buffer.from('\n# changed')]))
-    assert.notEqual(await runtimeCacheKey(options), key, file)
-    await writeFile(join(root, file), old)
-  }
-  await writeFile(join(root, 'scripts/new-verifier.mjs'), 'new input')
-  assert.notEqual(await runtimeCacheKey(options), key)
-  await rm(join(root, 'scripts/new-verifier.mjs'))
-  await mkdir(join(root, 'scripts/node_modules/ignored'), { recursive: true })
-  await writeFile(join(root, 'scripts/node_modules/ignored/a'), 'generated')
+  for (const file of [...RUNTIME_MODULES, 'scripts/windows-runtime-cache.mjs']) await modify(root, file, old => old + '\n// runtime change\n', async () => assert.notEqual(await runtimeCacheKey(options), key, file))
+  await modify(root, 'src-tauri/Cargo.toml', old => old.replace('openclaw-version = "2026.8.1"', 'openclaw-version = "2026.8.2"'), async () => assert.notEqual(await runtimeCacheKey(options), key))
+  await modify(root, 'scripts/verify-openclaw-release-contract.mjs', old => old.replace("'24.19.0'", "'24.20.0'"), async () => assert.match(await runtimeCacheKey(options), /node-24\.20\.0-/))
+  assert.deepEqual(RUNTIME_RECIPE, ['scripts/build-openclaw-runtime-bundle.mjs', '--force', '--platform', 'win32', '--arch', 'x64'])
+})
+test('application versions, frontend, Rust, signing/Perl workflows, plugins, tests and unrelated dependencies preserve the key', async t => {
+  const { root } = await fixture(t)
+  const options = { projectRoot: root }, key = await runtimeCacheKey(options)
+  const irrelevant = ['package.json', 'src/App.tsx', 'src-tauri/src/runtime.rs', 'src-tauri/Cargo.lock', 'src-tauri/tauri.windows.conf.json', 'scripts/unrelated.test.mjs', '.github/workflows/desktop-build-windows.yml', 'src-tauri/resources/plugins/uniopc/plugin/dist/index.js']
+  for (const file of irrelevant) { await mkdir(dirname(join(root, file)), { recursive: true }); await writeFile(join(root, file), 'arbitrary changed application input') }
+  await modify(root, 'src-tauri/Cargo.toml', old => old.replace('version = "0.4.19"', 'version = "9.9.9"') + '\n# unrelated metadata\n', async () => assert.equal(await runtimeCacheKey(options), key))
+  await modify(root, 'package-lock.json', old => {
+    const lock = JSON.parse(old); lock.version = '9.9.9'; lock.packages[''].version = '9.9.9'; lock.packages[''].devDependencies.vite = '99.0.0'; lock.packages['node_modules/vite'].version = '99.0.0'; return JSON.stringify(lock)
+  }, async () => assert.equal(await runtimeCacheKey(options), key))
   assert.equal(await runtimeCacheKey(options), key)
-  await symlink(join(root, 'package.json'), join(root, 'scripts/link.mjs'))
-  await assert.rejects(runtimeCacheKey(options), /symlink/)
+})
+test('lock projection binds physical runtime dependency closure, package bytes and dependency edges', async t => {
+  const { root } = await fixture(t)
+  const original = JSON.parse(await readFile(join(root, 'package-lock.json'), 'utf8'))
+  const closure = parserLockClosure(original)
+  assert.deepEqual(closure.packages.map(p => p.location), ['node_modules/@babel/helper-string-parser', 'node_modules/@babel/helper-validator-identifier', 'node_modules/@babel/parser', 'node_modules/@babel/types'])
+  for (const name of closure.packages.map(p => p.location)) for (const field of ['version', 'integrity', 'resolved']) {
+    const lock = structuredClone(original); lock.packages[name][field] += 'changed'; assert.notDeepEqual(parserLockClosure(lock), closure, `${name}:${field}`)
+  }
+  const nested = structuredClone(original)
+  nested.packages['node_modules/@babel/parser/node_modules/@babel/types'] = structuredClone(original.packages['node_modules/@babel/types'])
+  assert.notDeepEqual(parserLockClosure(nested), closure)
+  const shadowed = structuredClone(original); shadowed.packages['scripts/node_modules/@babel/parser'] = structuredClone(original.packages['node_modules/@babel/parser']); assert.notDeepEqual(parserLockClosure(shadowed), closure)
+  const edge = structuredClone(original); edge.packages['node_modules/@babel/parser'].dependencies['@babel/types'] = '^7.30.0'; assert.notDeepEqual(parserLockClosure(edge), closure)
+  for (const mutate of [
+    lock => { delete lock.packages['node_modules/@babel/types'] },
+    lock => { lock.packages['node_modules/@babel/types'].link = true },
+    lock => { delete lock.packages['node_modules/@babel/types'].integrity },
+    lock => { delete lock.packages['node_modules/@babel/types'].resolved },
+    lock => { lock.packages['node_modules/@babel/types'].dependencies.missing = '1' },
+  ]) { const lock = structuredClone(original); mutate(lock); assert.throws(() => parserLockClosure(lock), /Missing|linked|Unresolved/) }
+  const options = { projectRoot: root }, key = await runtimeCacheKey(options)
+  await modify(root, 'package-lock.json', old => { const lock = JSON.parse(old); lock.packages['node_modules/@babel/parser'].version = '8.0.0'; return JSON.stringify(lock) }, async () => assert.notEqual(await runtimeCacheKey(options), key))
+})
+test('runtime import closure is complete and real imports cannot silently escape the key', async t => {
+  const { root } = await fixture(t)
+  assert.deepEqual(moduleImports(`import fs from 'node:fs'; const generated = 'import x from "fake"'; export { x } from './actual.mjs'`), ['./actual.mjs', 'node:fs'])
+  assert.throws(() => moduleImports("const p = import('./dynamic.mjs')"), /dynamic dependency/)
+  assert.equal((await runtimeProjection({ projectRoot: root })).modules.length, 5)
+  await modify(root, RUNTIME_MODULES[0], old => old + "\nimport extra from './unkeyed.mjs'\n", async () => assert.rejects(runtimeCacheKey({ projectRoot: root }), /import closure changed/))
+  await rm(join(root, RUNTIME_MODULES[0])); await symlink(join(sourceRoot, RUNTIME_MODULES[0]), join(root, RUNTIME_MODULES[0]))
+  await assert.rejects(runtimeCacheKey({ projectRoot: root }), /symlinks/)
+})
+test('one exact owner-main legacy seed is offered only for equal Git-object runtime projections', async t => {
+  const { root, inputs } = await fixture(t)
+  const saved = new Map(await Promise.all(inputs.map(async file => [file, await readFile(join(root, file), 'utf8')])))
+  saved.set('.github/workflows/prepare-windows-runtime.yml', 'run: npm run build:openclaw-runtime -- --force --platform win32 --arch x64\n')
+  saved.set('package.json', JSON.stringify({ scripts: { 'build:openclaw-runtime': 'node scripts/build-openclaw-runtime-bundle.mjs' } }))
+  const readLegacyInput = file => { if (!saved.has(file)) throw new Error('missing object'); return saved.get(file) }
+  const opts = { projectRoot: root, readLegacyInput }
+  assert.equal(await legacySeedKey(opts), LEGACY_SEED_KEY)
+  assert.match(LEGACY_SEED_KEY, /-6d5c2ef2cad65aeb983b030065bf6522ec04a363e76f8bee48d03a5add40750d$/)
+  await modify(root, RUNTIME_MODULES[0], old => old + '\n// changed engine\n', async () => assert.equal(await legacySeedKey(opts), ''))
+  const seedWorkflow = saved.get('.github/workflows/prepare-windows-runtime.yml')
+  saved.set('.github/workflows/prepare-windows-runtime.yml', seedWorkflow.replace('--force', '--changed-recipe')); assert.equal(await legacySeedKey(opts), '')
+  saved.set('.github/workflows/prepare-windows-runtime.yml', seedWorkflow)
+  saved.set('package.json', '{}'); assert.equal(await legacySeedKey(opts), '')
+  assert.equal(await legacySeedKey({ projectRoot: root, readLegacyInput: () => { throw new Error('missing historical object') } }), '')
+  assert.equal(await legacySeedKey(), LEGACY_SEED_KEY, 'real pinned Git objects match current runtime inputs')
 })
 test('cache validation checks real hashes before branding and propagates all failures', async t => {
   const { root } = await fixture(t)

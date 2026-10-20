@@ -6,7 +6,7 @@ import test from 'node:test'
 import vm from 'node:vm'
 const root = resolve(import.meta.dirname, '..')
 const read = file => readFileSync(resolve(root, '.github/workflows', file), 'utf8')
-const candidate = read('desktop-release.yml'), windows = read('desktop-build-windows.yml'), checks = read('desktop-build-checks.yml'), promote = read('desktop-promote.yml'), warm = read('prepare-windows-runtime.yml')
+const candidate = read('desktop-release.yml'), windows = read('desktop-build-windows.yml'), checks = read('desktop-build-checks.yml'), promote = read('desktop-promote.yml'), warm = read('prepare-windows-runtime.yml'), probe = read('runtime-cache-reuse.yml')
 function job(document, name) {
   const match = document.match(new RegExp(`^  ${name}:\\n[\\s\\S]*?(?=^  [\\w-]+:\\n|$(?![\\s\\S]))`, 'm'))
   assert.ok(match, name)
@@ -86,37 +86,60 @@ test('verification uses read-only permissions without production environment; pr
   assert.match(promote, /group: desktop-stable-promotion\n\s+cancel-in-progress: false/)
   assert.doesNotMatch(promote, /npm (ci|run)|build:release|TAURI_SIGNING_PRIVATE_KEY|workflow_run:|pull_request:/)
 })
-test('runtime cache is main-warmed, exactly keyed, read-only in candidates, and always verified', () => {
-  const runtime = job(windows, 'prepare-openclaw-runtime-windows')
-  assert.equal(evaluateJob(job(warm, 'prepare'), { ...owner, event_name: 'workflow_dispatch', ref: 'refs/heads/main' }), true)
-  for (const mutation of [{ ref: 'refs/heads/fork' }, { actor: 'other' }, { triggering_actor: 'other' }, { repository: 'fork/repo' }, { event_name: 'push' }]) assert.equal(evaluateJob(job(warm, 'prepare'), { ...owner, event_name: 'workflow_dispatch', ref: 'refs/heads/main', ...mutation }), false)
+test('runtime V2 cache warms automatically on owner-main runtime changes and candidates only read it', () => {
+  const runtime = job(windows, 'prepare-openclaw-runtime-windows'), prepare = job(warm, 'prepare')
+  for (const event_name of ['workflow_dispatch', 'push']) assert.equal(evaluateJob(prepare, { ...owner, event_name, ref: 'refs/heads/main' }), true)
+  for (const mutation of [{ ref: 'refs/heads/fork' }, { actor: 'other' }, { triggering_actor: 'other' }, { repository: 'fork/repo' }, { event_name: 'pull_request' }]) assert.equal(evaluateJob(prepare, { ...owner, event_name: 'workflow_dispatch', ref: 'refs/heads/main', ...mutation }), false)
+  assert.match(warm, /push:\n    branches: \[main\]/)
+  for (const path of ['scripts/build-openclaw-runtime-bundle.mjs', 'scripts/uniopc-runtime-scopes.mjs', 'scripts/uniopc-runtime-branding.mjs', 'scripts/verify-openclaw-release-contract.mjs', 'scripts/verify-uniopc-whitelabel-runtime.mjs', 'scripts/windows-runtime-cache.mjs', 'src-tauri/Cargo.toml', 'package-lock.json', '.github/workflows/prepare-windows-runtime.yml']) assert.ok(warm.includes(`      - ${path}\n`), path)
   assert.doesNotMatch(warm, /secrets\.|environment:/)
   assert.match(warm, /actions\/cache\/save@[a-f0-9]{40}/)
-  assert.doesNotMatch(runtime, /actions\/cache\/save|restore-keys:/)
+  assert.doesNotMatch(runtime, /actions\/cache\/save|restore-keys:|seed-key|legacy-seed/)
   for (const document of [runtime, warm]) {
-    assert.match(document, /actions\/cache\/restore@[a-f0-9]{40}/)
     assert.match(document, /key: \$\{\{ steps.runtime-key.outputs.key \}\}/)
-    assert.match(document, /if: steps.runtime-cache.outputs.cache-hit != 'true'/)
-    assert.match(document, /build:openclaw-runtime -- --force --platform win32 --arch x64/)
-    assert.match(document, /run: node scripts\/windows-runtime-cache.mjs verify/)
+    assert.match(document, /run: node scripts\/windows-runtime-cache.mjs build/)
+    assert.doesNotMatch(document, /npm run build:openclaw-runtime/)
+    const hit = document.indexOf("if: steps.runtime-cache.outputs.cache-hit == 'true'")
+    const verify = document.indexOf('run: node scripts/windows-runtime-cache.mjs verify', hit)
+    const install = document.indexOf('run: npm ci --legacy-peer-deps')
+    assert.ok(hit > 0 && verify > hit && verify < install, 'hit verifies before installing dependencies')
+    assert.match(document.slice(document.lastIndexOf('      - ', install), install), /if: steps.runtime-cache.outputs.cache-hit != 'true'/)
     for (const cache of document.matchAll(/uses: actions\/cache\/(?:restore|save)@[^\n]+\n([\s\S]*?)(?=^      - |$(?![\s\S]))/gm)) {
       const paths = [...cache[1].matchAll(/^            (.+)$/gm)].map(m => m[1])
       assert.deepEqual(paths, ['src-tauri/resources/uniopc-engine-runtime/uniopc-engine-runtime-win32-x64.tar.gz', 'src-tauri/resources/uniopc-engine-runtime/uniopc-engine-runtime.catalog.json'])
     }
   }
+  assert.match(warm, /run: node scripts\/windows-runtime-cache.mjs seed-key/)
+  assert.match(warm, /if: steps.runtime-cache.outputs.cache-hit != 'true' && steps.seed-key.outputs.key != ''/)
+  assert.match(warm, /key: \$\{\{ steps.seed-key.outputs.key \}\}/)
+  const seedCheck = warm.indexOf("if: steps.legacy-seed.outputs.cache-hit == 'true'")
+  assert.ok(warm.indexOf('windows-runtime-cache.mjs verify', seedCheck) < warm.indexOf('actions/cache/save@'))
+  assert.match(warm, /if: steps.runtime-cache.outputs.cache-hit != 'true' && steps.legacy-seed.outputs.cache-hit != 'true'/)
+})
+test('runtime-only tag probe verifies exact V2 reuse without credentials, installs, writes or compilation', () => {
+  assert.match(probe, /tags: \['test\/runtime-cache\/\*'\]/)
+  assert.match(probe, /contents: read/)
+  assert.doesNotMatch(probe, /environment:|secrets\.|npm ci|build:release|windows-runtime-cache.mjs (build|seed-key)|cache\/save|restore-keys:/)
+  assert.match(probe, /public-release-guard.mjs runtime-probe/)
+  assert.match(probe, /key: \$\{\{ steps.runtime-key.outputs.key \}\}/)
+  assert.match(probe, /if: steps.runtime-cache.outputs.cache-hit != 'true'[\s\S]*exit 1/)
+  assert.match(probe, /windows-runtime-cache.mjs verify/)
+  const section = job(probe, 'verify-runtime-cache')
+  assert.equal(evaluateJob(section, owner), true)
+  for (const mutation of [{ actor: 'other' }, { triggering_actor: 'other' }, { repository: 'fork/repo' }, { event_name: 'pull_request' }]) assert.equal(evaluateJob(section, { ...owner, ...mutation }), false)
 })
 test('all third-party actions are immutable; checkout uses exact SHA without persisted credentials', () => {
   for (const name of readdirSync(resolve(root, '.github/workflows'))) {
     const document = read(name)
     for (const use of document.matchAll(/uses: ([^\s]+)/g)) if (!use[1].startsWith('./')) assert.match(use[1], /@[a-f0-9]{40}$/)
   }
-  for (const document of [candidate, windows, checks, promote, warm]) for (const checkout of document.matchAll(/- uses: actions\/checkout@[^\n]+\n([\s\S]*?)(?=^      - |$(?![\s\S]))/gm)) {
+  for (const document of [candidate, windows, checks, promote, warm, probe]) for (const checkout of document.matchAll(/- uses: actions\/checkout@[^\n]+\n([\s\S]*?)(?=^      - |$(?![\s\S]))/gm)) {
     assert.match(checkout[1], /ref: \$\{\{ github.sha \}\}/)
     assert.match(checkout[1], /persist-credentials: false/)
   }
 })
 test('embedded Bash is syntactically valid', () => {
-  for (const document of [candidate, windows, checks, promote, warm]) for (const match of document.matchAll(/^        run: \|\n((?:          [^\n]*\n|\n)+)/gm)) {
+  for (const document of [candidate, windows, checks, promote, warm, probe]) for (const match of document.matchAll(/^        run: \|\n((?:          [^\n]*\n|\n)+)/gm)) {
     if (match[1].includes('$perl')) continue
     execFileSync('bash', ['-n'], { input: match[1].split('\n').map(line => line.slice(10)).join('\n') })
   }
