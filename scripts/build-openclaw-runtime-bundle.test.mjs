@@ -1,13 +1,17 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { readFile } from 'node:fs/promises'
 import test from 'node:test'
+import Module, { createRequire, stripTypeScriptTypes } from 'node:module'
+import { pathToFileURL } from 'node:url'
+import { WINDOWS_NATIVE_REQUIRE_ORIGINAL, WINDOWS_NATIVE_REQUIRE_PATCHED } from './verify-uniopc-whitelabel-runtime.mjs'
 
 import {
   isMachOMagic,
+  patchWindowsNativeModuleRequire,
   addLocalMediaIdToChatAttachmentSchema,
   preserveLocalMediaIdInRpcAttachmentNormalizer,
   resolveTrustedLocalMediaInAttachmentParser,
@@ -276,4 +280,284 @@ test('patches local media refs into the pinned OpenClaw 2026.8.1 runtime sources
   } finally {
     rmSync(temp, { recursive: true, force: true })
   }
+})
+
+// Verbatim 2026.8.1 native/cache routines from the installed runtime. Modules,
+// dependencies and fallback factory below are real temporary test artifacts.
+const nativeLoaderFixture = [
+  "//#region src/plugins/native-module-require.ts",
+  "const nodeRequire = createRequire(import.meta.url);",
+  "const moduleWithResolver$1 = Module;",
+  "/** True for file extensions Node can load through the native JS module loader. */",
+  "function isJavaScriptModulePath(modulePath) {",
+  "\treturn [",
+  "\t\t\".js\",",
+  "\t\t\".mjs\",",
+  "\t\t\".cjs\"",
+  "\t].includes(path.extname(modulePath).toLowerCase());",
+  "}",
+  "function isMissingTargetModuleError(error, modulePath) {",
+  "\tif (error.code !== \"MODULE_NOT_FOUND\" || typeof error.message !== \"string\") return false;",
+  "\tconst firstLine = error.message.split(\"\\n\", 1)[0] ?? \"\";",
+  "\treturn firstLine.includes(`'${modulePath}'`) || firstLine.includes(`\"${modulePath}\"`);",
+  "}",
+  "function isSourceTransformFallbackError(error, modulePath) {",
+  "\tif (!error || typeof error !== \"object\") return false;",
+  "\tconst candidate = error;",
+  "\tconst code = candidate.code;",
+  "\treturn code === \"ERR_REQUIRE_ESM\" || code === \"ERR_REQUIRE_ASYNC_MODULE\" || code === \"ERR_REQUIRE_ESM_RACE_CONDITION\" || isMissingTargetModuleError(candidate, modulePath);",
+  "}",
+  "/** Attempts native require before falling back to source transform paths. */",
+  "function tryNativeRequireJavaScriptModule(modulePath, options = {}) {",
+  "\tif (process.platform === \"win32\" && options.allowWindows !== true) return { ok: false };",
+  "\tif (!isJavaScriptModulePath(modulePath)) return { ok: false };",
+  "\ttry {",
+  "\t\treturn {",
+  "\t\t\tok: true,",
+  "\t\t\tmoduleExport: requireWithOptionalAliases(modulePath, options.aliasMap)",
+  "\t\t};",
+  "\t} catch (error) {",
+  "\t\tconst code = error && typeof error === \"object\" ? error.code : void 0;",
+  "\t\tif (isSourceTransformFallbackError(error, modulePath) || options.fallbackOnNativeError || options.fallbackOnMissingDependency === true && (code === \"MODULE_NOT_FOUND\" || code === \"ERR_MODULE_NOT_FOUND\")) return { ok: false };",
+  "\t\tthrow error;",
+  "\t}",
+  "}",
+  "/** Clears native and source-transformed modules within the plugin dependency root. */",
+  "function clearPluginModuleRequireCache(modulePath, options = {}) {",
+  "\ttry {",
+  "\t\tconst resolved = nodeRequire.resolve(modulePath);",
+  "\t\tclearRequireCacheSubtree(resolved, resolveRequireCachePath(options.dependencyRoot ?? path.dirname(resolved)), /* @__PURE__ */ new Set());",
+  "\t} catch {}",
+  "}",
+  "function resolveRequireCachePath(targetPath) {",
+  "\ttry {",
+  "\t\treturn fs.realpathSync.native(targetPath);",
+  "\t} catch {",
+  "\t\treturn path.resolve(targetPath);",
+  "\t}",
+  "}",
+  "function clearRequireCacheSubtree(resolvedPath, dependencyRoot, seen) {",
+  "\tif (seen.has(resolvedPath)) return;",
+  "\tseen.add(resolvedPath);",
+  "\tconst cached = nodeRequire.cache[resolvedPath];",
+  "\tif (cached) {",
+  "\t\tfor (const child of cached.children) if (isPathInside(dependencyRoot, child.id)) clearRequireCacheSubtree(child.id, dependencyRoot, seen);",
+  "\t}",
+  "\tdelete nodeRequire.cache[resolvedPath];",
+  "}",
+  "function requireWithOptionalAliases(modulePath, aliasMap) {",
+  "\treturn withNativeRequireAliases(aliasMap, () => createRequire(import.meta.url)(modulePath));",
+  "}",
+  "/** Runs a native require block with temporary CJS/ESM alias hooks and restores both afterward. */",
+  "function withNativeRequireAliases(aliasMap, run) {",
+  "\tif (!aliasMap || !moduleWithResolver$1[\"_resolveFilename\"]) return run();",
+  "\tconst resolveAlias = typeof aliasMap === \"function\" ? aliasMap : (specifier) => aliasMap[specifier];",
+  "\tconst originalResolveFilename = moduleWithResolver$1[\"_resolveFilename\"];",
+  "\tconst esmHooks = moduleWithResolver$1.registerHooks?.({ resolve(specifier, context, nextResolve) {",
+  "\t\tconst aliasTarget = resolveAlias(specifier);",
+  "\t\tif (aliasTarget) return {",
+  "\t\t\tshortCircuit: true,",
+  "\t\t\turl: pathToFileURL(aliasTarget).href",
+  "\t\t};",
+  "\t\treturn nextResolve(specifier, context);",
+  "\t} });",
+  "\tmoduleWithResolver$1[\"_resolveFilename\"] = ((request, parent, isMain, options) => {",
+  "\t\tconst aliasTarget = resolveAlias(request);",
+  "\t\tif (aliasTarget) return aliasTarget;",
+  "\t\treturn originalResolveFilename(request, parent, isMain, options);",
+  "\t});",
+  "\ttry {",
+  "\t\treturn run();",
+  "\t} finally {",
+  "\t\tmoduleWithResolver$1[\"_resolveFilename\"] = originalResolveFilename;",
+  "\t\tesmHooks?.deregister();",
+  "\t}",
+  "}",
+  "//#endregion"
+].join('\n')
+const cachedLoaderFixture = [
+  "function createLazySourceTransformLoader(params) {",
+  "\tlet loadWithSourceTransform;",
+  "\treturn () => {",
+  "\t\tif (loadWithSourceTransform) return loadWithSourceTransform;",
+  "\t\tconst jitiOptions = buildPluginLoaderJitiOptions(params.getAliasMap(), { modulePath: params.loaderFilename });",
+  "\t\tconst jitiLoader = (params.createLoader ?? loadCreateJitiLoaderFactory())(params.loaderFilename, {",
+  "\t\t\t...jitiOptions,",
+  "\t\t\tnativeModules: params.transformOpenClawDependencies ? jitiOptions.nativeModules.filter((moduleName) => moduleName !== \"openclaw\") : jitiOptions.nativeModules,",
+  "\t\t\ttryNative: false",
+  "\t\t});",
+  "\t\tloadWithSourceTransform = (target) => jitiLoader(toSourceTransformImportPath(target));",
+  "\t\treturn loadWithSourceTransform;",
+  "\t};",
+  "}",
+  "function createPluginModuleLoader(params) {",
+  "\tconst getLoadWithSourceTransform = createLazySourceTransformLoader({ ...params });",
+  "\tconst loadCachedTarget = (target, load) => {",
+  "\t\tconst source = getPluginCacheSource(target, params.cache);",
+  "\t\tconst cached = source.variants.get(params.cacheKey)?.exports;",
+  "\t\tif (cached) return cached.value;",
+  "\t\tsource.boundaryRoot = params.rootDir ?? source.boundaryRoot ?? path.dirname(target.startsWith(\"file:\") ? fileURLToPath(target) : target);",
+  "\t\tconst loaded = withPluginCache(params.cache, load);",
+  "\t\tsource.variants.set(params.cacheKey, { exports: { value: loaded } });",
+  "\t\treturn loaded;",
+  "\t};",
+  "\tif (!params.tryNative) return (target) => loadCachedTarget(target, () => {",
+  "\t\tpluginModuleLoaderStats.calls += 1;",
+  "\t\tpluginModuleLoaderStats.sourceTransformForced += 1;",
+  "\t\trecordSourceTransformTarget(target);",
+  "\t\treturn getLoadWithSourceTransform()(target);",
+  "\t});",
+  "\treturn (target) => loadCachedTarget(target, () => {",
+  "\t\tpluginModuleLoaderStats.calls += 1;",
+  "\t\tconst native = tryNativeRequireJavaScriptModule(target, {",
+  "\t\t\tallowWindows: true,",
+  "\t\t\taliasMap: params.resolveAlias,",
+  "\t\t\tfallbackOnMissingDependency: true",
+  "\t\t});",
+  "\t\tif (native.ok) {",
+  "\t\t\tpluginModuleLoaderStats.nativeHits += 1;",
+  "\t\t\treturn native.moduleExport;",
+  "\t\t}",
+  "\t\tpluginModuleLoaderStats.nativeMisses += 1;",
+  "\t\tpluginModuleLoaderStats.sourceTransformFallbacks += 1;",
+  "\t\trecordSourceTransformTarget(target);",
+  "\t\treturn getLoadWithSourceTransform()(target);",
+  "\t});",
+  "}"
+].join('\n')
+async function nativeLoaderStage(t) {
+  const prefix = realpathSync.native(mkdtempSync(join(tmpdir(), 'uniopc-native-loader-')))
+  t.after(() => rmSync(prefix, { recursive: true, force: true }))
+  const dist = join(prefix, 'tools/node/node_modules/uniopc-engine/dist')
+  mkdirSync(dist, { recursive: true })
+  writeFileSync(join(dist, '../package.json'), JSON.stringify({ name: 'openclaw', type: 'module' }))
+  const file = join(dist, 'loader-fixture.js')
+  const prelude = `import Module, { createRequire, stripTypeScriptTypes } from 'node:module';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import fs from 'node:fs';import path from 'node:path';
+const isPathInside=(root,file)=>{const rel=path.relative(root,file);return rel!== '..'&&!rel.startsWith('..'+path.sep)&&!path.isAbsolute(rel)};
+`
+  const cacheDependencies = `
+const pluginModuleLoaderStats={calls:0,nativeHits:0,nativeMisses:0,sourceTransformForced:0,sourceTransformFallbacks:0};
+function getPluginCacheSource(target,cache){const key=path.resolve(target.startsWith('file:')?fileURLToPath(target):target);let source=cache.sources.get(key);if(!source){source={variants:new Map()};cache.sources.set(key,source)}return source}
+const withPluginCache=(cache,run)=>run();const recordSourceTransformTarget=()=>{};
+const toSourceTransformImportPath=target=>target;
+const buildPluginLoaderJitiOptions=alias=>({alias,nativeModules:['openclaw']});
+const loadCreateJitiLoaderFactory=()=>{throw new Error('fixture requires explicit fallback factory')};
+`
+  writeFileSync(file, prelude + nativeLoaderFixture + cacheDependencies + cachedLoaderFixture
+    + '\nexport {tryNativeRequireJavaScriptModule,clearPluginModuleRequireCache,withNativeRequireAliases,createPluginModuleLoader};')
+  await patchWindowsNativeModuleRequire(prefix)
+  const loader = await import(pathToFileURL(file).href)
+  return { prefix, dist, file, loader }
+}
+
+test('native loader patch is unique, idempotent and rejects missing or drifting staged helpers before writing', async t => {
+  assert.ok(nativeLoaderFixture.includes(WINDOWS_NATIVE_REQUIRE_ORIGINAL), 'recorded upstream fixture must match the pinned shape')
+  const {prefix,dist,file}=await nativeLoaderStage(t)
+  const patched=readFileSync(file,'utf8')
+  assert.ok(patched.includes(WINDOWS_NATIVE_REQUIRE_PATCHED))
+  await patchWindowsNativeModuleRequire(prefix)
+  assert.equal(readFileSync(file,'utf8'),patched)
+  const duplicate=join(dist,'second.mjs');writeFileSync(duplicate,patched)
+  await assert.rejects(patchWindowsNativeModuleRequire(prefix),/exactly one helper/)
+  assert.equal(readFileSync(file,'utf8'),patched)
+  rmSync(duplicate)
+  writeFileSync(file,patched.replace('options.allowWindows !== true','options.allowWindows !== false'))
+  await assert.rejects(patchWindowsNativeModuleRequire(prefix),/structure drifted/)
+  writeFileSync(file,'export const noHelper=true;')
+  await assert.rejects(patchWindowsNativeModuleRequire(prefix),/exactly one helper/)
+})
+
+test('native loader loads real path/file URLs once, preserves special names and transitive CJS/ESM identity', async t => {
+  const {dist,loader}=await nativeLoaderStage(t)
+  const dependency=join(dist,'dependency.cjs');writeFileSync(dependency,'module.exports={value:42}')
+  for(const extension of ['cjs','mjs']){
+    const file=join(dist,`space 中文 # %.${extension}`)
+    const key='native-'+dist+extension
+    writeFileSync(file,extension==='cjs'
+      ?`globalThis[${JSON.stringify(key)}]=(globalThis[${JSON.stringify(key)}]||0)+1;module.exports={dependency:require('./dependency.cjs')};`
+      :`import dependency from './dependency.cjs';globalThis[${JSON.stringify(key)}]=(globalThis[${JSON.stringify(key)}]||0)+1;export {dependency};`)
+    const byPath=loader.tryNativeRequireJavaScriptModule(file,{allowWindows:true})
+    const byUrl=loader.tryNativeRequireJavaScriptModule(pathToFileURL(file).href,{allowWindows:true})
+    assert.equal(byPath.ok,true);assert.equal(byUrl.moduleExport,byPath.moduleExport)
+    const imported=await import(pathToFileURL(file).href)
+    assert.equal(extension==='cjs'?imported.default:imported,byPath.moduleExport)
+    assert.equal(byUrl.moduleExport.dependency.value,42);assert.equal(globalThis[key],1)
+    delete globalThis[key]
+  }
+})
+
+test('native loader rejects URL identity loss before extension/require or permissive fallback classification', async t => {
+  const {dist,loader}=await nativeLoaderStage(t)
+  const url=pathToFileURL(join(dist,'missing.cjs')).href
+  for(const bad of [url+'?query',url+'?',url+'#fragment',url+'#',url.replace('missing','%2fmissing'),url.replace('missing','%5cmissing'),url.replace('missing','%ZZmissing')]){
+    assert.throws(()=>loader.tryNativeRequireJavaScriptModule(bad,{allowWindows:true,fallbackOnNativeError:true}),/identity|encoded|URI|URL/i)
+  }
+})
+
+test('native loader retains real errors, target/dependency fallback and top-level-await import fallback', async t => {
+  const {dist,loader}=await nativeLoaderStage(t)
+  const load=(file,options={})=>loader.tryNativeRequireJavaScriptModule(pathToFileURL(file).href,{allowWindows:true,...options})
+  assert.deepEqual(load(join(dist,'absent.cjs')),{ok:false})
+  const missing=join(dist,'missing-dependency.cjs');writeFileSync(missing,"require('uniopc-nonexistent-transitive-fixture')")
+  assert.throws(()=>load(missing),error=>error.code==='MODULE_NOT_FOUND'&&error.message.includes('uniopc-nonexistent-transitive-fixture'))
+  assert.deepEqual(load(missing,{fallbackOnMissingDependency:true}),{ok:false})
+  const failure=join(dist,'failure.cjs');writeFileSync(failure,"throw new Error('real-fixture-error')")
+  assert.throws(()=>load(failure),/real-fixture-error/)
+  assert.deepEqual(load(failure,{fallbackOnNativeError:true}),{ok:false})
+  const tla=join(dist,'tla.mjs');writeFileSync(tla,'await Promise.resolve();export const value=17')
+  assert.deepEqual(load(tla),{ok:false})
+  assert.equal((await import(pathToFileURL(tla).href)).value,17)
+})
+
+test('native loader alias hooks restore on success/error and mixed fallback shares one SDK and cache generation', async t => {
+  const {dist,loader}=await nativeLoaderStage(t)
+  const sdk=join(dist,'sdk.cjs'),native=join(dist,'native.cjs'),fallback=join(dist,'fallback.cts')
+  const key='sdk-'+dist;globalThis[key]={evaluations:0,registrations:0}
+  writeFileSync(sdk,`globalThis[${JSON.stringify(key)}].evaluations++;const registrations=new Set();module.exports={register(id){if(!registrations.has(id)){registrations.add(id);globalThis[${JSON.stringify(key)}].registrations++}},registrations};`)
+  writeFileSync(native,"const sdk=require('fixture-sdk');sdk.register('shared');module.exports={sdk};")
+  writeFileSync(fallback,"const sdk: any=require('fixture-sdk');sdk.register('shared');module.exports={sdk};")
+  const aliases={'fixture-sdk':sdk};const original=Module._resolveFilename
+  const first=loader.tryNativeRequireJavaScriptModule(pathToFileURL(native).href,{allowWindows:true,aliasMap:aliases})
+  assert.equal(first.ok,true);assert.equal(Module._resolveFilename,original)
+  const esmAlias=join(dist,'alias-esm.mjs');writeFileSync(esmAlias,"import sdk from 'fixture-sdk';export {sdk};")
+  assert.equal(loader.tryNativeRequireJavaScriptModule(pathToFileURL(esmAlias).href,{allowWindows:true,aliasMap:aliases}).moduleExport.sdk,first.moduleExport.sdk)
+  const resolverFailure=join(dist,'resolver-error.cjs');writeFileSync(resolverFailure,"require('fixture-sdk')")
+  assert.throws(()=>loader.tryNativeRequireJavaScriptModule(resolverFailure,{allowWindows:true,aliasMap:()=>{throw new Error('resolver-failure')}}),/resolver-failure/)
+  assert.equal(Module._resolveFilename,original)
+
+  const errorFile=join(dist,'alias-error.cjs');writeFileSync(errorFile,"require('fixture-sdk');throw new Error('alias-failure')")
+  assert.throws(()=>loader.tryNativeRequireJavaScriptModule(errorFile,{allowWindows:true,aliasMap:aliases}),/alias-failure/)
+  assert.equal(Module._resolveFilename,original)
+  assert.throws(()=>createRequire(import.meta.url)('fixture-sdk'),/Cannot find module/)
+  const requireFixture=createRequire(pathToFileURL(join(dist,'entry.cjs')))
+  let factories=0,fallbackCalls=0
+  const params={cache:{sources:new Map()},cacheKey:'generation-1',rootDir:dist,loaderFilename:native,
+    getAliasMap:()=>aliases,resolveAlias:specifier=>aliases[specifier],tryNative:true,transformOpenClawDependencies:true,
+    createLoader:(filename,options)=>{factories++;assert.equal(options.tryNative,false);assert.deepEqual(options.nativeModules,[]);
+      return target=>{fallbackCalls++;
+        const transformed=new Module(target);transformed.filename=target;transformed.paths=Module._nodeModulePaths(dirname(target));
+        requireFixture.cache[target]=transformed;
+        try{return loader.withNativeRequireAliases(options.alias,()=>{
+          transformed._compile(stripTypeScriptTypes(readFileSync(target,'utf8')),target);transformed.loaded=true;return transformed.exports;
+        })}catch(error){delete requireFixture.cache[target];throw error}
+      }}
+  }
+  const cached=loader.createPluginModuleLoader(params)
+  const second=cached(fallback)
+  assert.equal(second.sdk,first.moduleExport.sdk)
+  assert.equal(cached(pathToFileURL(fallback).href),second)
+  assert.equal(cached(native),first.moduleExport)
+  assert.deepEqual(globalThis[key],{evaluations:1,registrations:1})
+  assert.equal(factories,1);assert.equal(fallbackCalls,1)
+  // Retiring the generation clears the native dependency subtree before reload.
+  loader.clearPluginModuleRequireCache(native,{dependencyRoot:dist})
+  loader.clearPluginModuleRequireCache(fallback,{dependencyRoot:dist})
+  const next=loader.createPluginModuleLoader({...params,cache:{sources:new Map()},cacheKey:'generation-2'})
+  const reloaded=next(native)
+  assert.notEqual(reloaded.sdk,second.sdk)
+  assert.deepEqual(globalThis[key],{evaluations:2,registrations:2})
+  assert.equal(Module._resolveFilename,original)
+  delete globalThis[key]
 })

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import assert from 'node:assert/strict'
+import { parse } from '@babel/parser'
 import { execFileSync } from 'node:child_process'
 import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -21,6 +22,66 @@ const LEGAL_ATTRIBUTION_LINES = [
   '"X-OpenRouter-Title": "OpenClaw"',
   '"X-OpenRouter-Title":"OpenClaw"',
 ]
+// Pinned 2026.8.1 loader structure, shared by the unsigned-stage patch and
+// archive verifier. A marker or a second helper cannot satisfy this contract.
+export const WINDOWS_NATIVE_REQUIRE_ORIGINAL = String.raw`function tryNativeRequireJavaScriptModule(modulePath, options = {}) {
+	if (process.platform === "win32" && options.allowWindows !== true) return { ok: false };
+	if (!isJavaScriptModulePath(modulePath)) return { ok: false };
+	try {
+		return {
+			ok: true,
+			moduleExport: requireWithOptionalAliases(modulePath, options.aliasMap)
+		};
+	} catch (error) {
+		const code = error && typeof error === "object" ? error.code : void 0;
+		if (isSourceTransformFallbackError(error, modulePath) || options.fallbackOnNativeError || options.fallbackOnMissingDependency === true && (code === "MODULE_NOT_FOUND" || code === "ERR_MODULE_NOT_FOUND")) return { ok: false };
+		throw error;
+	}
+}`
+export const WINDOWS_NATIVE_REQUIRE_PATCHED = WINDOWS_NATIVE_REQUIRE_ORIGINAL.replace(
+  '\tif (!isJavaScriptModulePath(modulePath))',
+  `\tif (/^file:/i.test(modulePath)) {
+\t\tconst nativeUrl = new URL(modulePath);
+\t\tif (modulePath.includes("?") || modulePath.includes("#") || /%2f|%5c/i.test(nativeUrl.pathname)) throw new TypeError("Native module file URL must preserve its exact identity");
+\t\tmodulePath = fileURLToPath(nativeUrl);
+\t}
+\tif (!isJavaScriptModulePath(modulePath))`,
+)
+
+export function inspectWindowsNativeRequireSources(sources, { allowUnpatched = false } = {}) {
+  const helpers = []
+  for (const entry of sources) {
+    if (!entry.source.includes('tryNativeRequireJavaScriptModule')) continue
+    const ast = parse(entry.source, { sourceType: 'module' })
+    const visit = node => {
+      if (!node || typeof node !== 'object') return
+      if (node.type === 'FunctionDeclaration' && node.id?.name === 'tryNativeRequireJavaScriptModule') {
+        helpers.push({ ...entry, start: node.start, end: node.end, body: entry.source.slice(node.start, node.end), ast, topLevel: ast.program.body.includes(node) })
+      }
+      for (const value of Object.values(node)) {
+        if (Array.isArray(value)) value.forEach(visit)
+        else if (value && typeof value === 'object') visit(value)
+      }
+    }
+    visit(ast.program)
+  }
+  assert.equal(helpers.length, 1, 'Windows native loader requires exactly one helper')
+  const helper = helpers[0]
+  assert.ok(helper.topLevel, 'Windows native loader helper declaration drift')
+  const region = '//#region src/plugins/native-module-require.ts'
+  const regionStart = helper.source.indexOf(region)
+  assert.ok(regionStart >= 0 && regionStart === helper.source.lastIndexOf(region)
+    && regionStart < helper.start && helper.source.indexOf('//#endregion', regionStart) >= helper.end,
+  'Windows native loader region drift')
+  assert.ok(helper.ast.program.body.some(node => node.type === 'ImportDeclaration'
+    && node.source.value === 'node:url' && node.specifiers.some(specifier => specifier.type === 'ImportSpecifier'
+      && specifier.imported.name === 'fileURLToPath' && specifier.local.name === 'fileURLToPath')),
+  'Windows native loader fileURLToPath import drift')
+  assert.ok(helper.body === WINDOWS_NATIVE_REQUIRE_PATCHED || (allowUnpatched && helper.body === WINDOWS_NATIVE_REQUIRE_ORIGINAL),
+    'Windows native loader compatibility patch missing or structure drifted')
+  return helper
+}
+
 export function assertRuntimeEntryNamesBranded(names) {
   const violations = names.map(name => name.replace(/^\.\//, '')).filter(name => (
     /openclaw|小龙虾/i.test(name)
@@ -147,12 +208,17 @@ export async function verifyRuntimeDirectory(runtimeDirectory = RUNTIME_DIR) {
     const stage = await mkdtemp(join(tmpdir(), 'uniopc-runtime-brand-scan-'))
     try {
       execFileSync(tarBin(), ['-xzf', archive, '-C', stage], { stdio: 'ignore' })
+      const nativeLoaderSources = []
       await walk(stage, async path => {
         const rel = path.slice(stage.length + 1).replaceAll('\\', '/')
         const normalized = rel.replace(/^\.\//, '')
         const bytes = await readFile(path).catch(() => null)
         if (bytes === null || !isReadableText(bytes)) return
         const text = bytes.toString('utf8')
+        if (artifact.platform === 'win32' && BRANDED_ENGINE_ROOT.test(normalized)
+          && /\/uniopc-engine\/dist\/.*\.[cm]?js$/i.test(normalized) && !/\/node_modules\//.test(normalized.split('/uniopc-engine/')[1])) {
+          nativeLoaderSources.push({ path: normalized, source: text })
+        }
         const internalReason = classifyInternalTextPath(normalized)
         if (internalReason) {
           const count = countBrandOccurrences(text)
@@ -197,6 +263,7 @@ export async function verifyRuntimeDirectory(runtimeDirectory = RUNTIME_DIR) {
           textViolations.push(...assertRuntimeFileTextBranded(text, normalized))
         }
       })
+      if (artifact.platform === 'win32') inspectWindowsNativeRequireSources(nativeLoaderSources)
     } finally {
       await rm(stage, { recursive: true, force: true })
     }

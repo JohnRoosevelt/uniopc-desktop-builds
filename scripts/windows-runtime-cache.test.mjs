@@ -94,7 +94,7 @@ test('one exact owner-main legacy seed is offered only for equal Git-object runt
   saved.set('.github/workflows/prepare-windows-runtime.yml', seedWorkflow)
   saved.set('package.json', '{}'); assert.equal(await legacySeedKey(opts), '')
   assert.equal(await legacySeedKey({ projectRoot: root, readLegacyInput: () => { throw new Error('missing historical object') } }), '')
-  assert.equal(await legacySeedKey(), LEGACY_SEED_KEY, 'real pinned Git objects match current runtime inputs')
+  assert.equal(await legacySeedKey(), '', 'runtime compatibility patch rejects stale pinned seed; fresh build required')
 })
 test('cache validation checks real hashes before branding and propagates all failures', async t => {
   const { root } = await fixture(t)

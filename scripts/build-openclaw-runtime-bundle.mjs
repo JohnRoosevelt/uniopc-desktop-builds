@@ -53,7 +53,7 @@ import { dirname, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { rebrandManagedRuntimeScopes } from './uniopc-runtime-scopes.mjs'
 import { rebrandEngineWrapperContract, rebrandPluginManifestPaths, rebrandCompiledRuntimePaths, rebrandRuntimeTree, retainRuntimeWorkspaceTemplates } from './uniopc-runtime-branding.mjs'
-import { verifyRuntimeDirectory } from './verify-uniopc-whitelabel-runtime.mjs'
+import { inspectWindowsNativeRequireSources, WINDOWS_NATIVE_REQUIRE_PATCHED, verifyRuntimeDirectory } from './verify-uniopc-whitelabel-runtime.mjs'
 
 import { OPENCLAW_RELEASE_NODE_VERSION } from './verify-openclaw-release-contract.mjs'
 
@@ -473,6 +473,25 @@ async function patchWindowsAclCheck(prefix) {
   if (sidFixed === 0 && envFixed === 0) {
     console.warn('Windows ACL fix: neither pattern found (engine may already be fixed).')
   }
+}
+
+// Runs only on the disposable unsigned Windows stage, never on an installed
+// runtime or an archive restored from cache. Inspect every helper before writing.
+export async function patchWindowsNativeModuleRequire(prefix) {
+  const { path: packageJsonPath } = await findInstalledPackageJson(prefix)
+  const sources = []
+  const collect = async directory => {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      if (entry.name === 'node_modules') continue
+      const path = join(directory, entry.name)
+      if (entry.isDirectory()) await collect(path)
+      else if (entry.isFile() && /\.[cm]?js$/.test(entry.name)) sources.push({ path, source: await readFile(path, 'utf8') })
+    }
+  }
+  await collect(join(dirname(packageJsonPath), 'dist'))
+  const helper = inspectWindowsNativeRequireSources(sources, { allowUnpatched: true })
+  const next = helper.source.slice(0, helper.start) + WINDOWS_NATIVE_REQUIRE_PATCHED + helper.source.slice(helper.end)
+  if (next !== helper.source) await writeFile(helper.path, next, 'utf8')
 }
 
 async function normalizeWindowsLayout(prefix) {
@@ -1033,6 +1052,8 @@ export async function buildOpenclawRuntimeBundle({
     const archivePath = join(outputDir, archiveName)
     const archiveStat = await stat(archivePath).catch(() => null)
     if (archiveStat?.size === existing.sizeBytes && archiveStat.size > 0) {
+      // Cached and --skip paths must prove the same actual loader structure.
+      await verifyRuntimeDirectory(outputDir)
       console.log(`Runtime bundle already present for openclaw ${version} (${platform}-${arch}); skipping. Use --force to rebuild.`)
       return { archivePath, manifest: existing, skipped: true }
     }
@@ -1051,6 +1072,7 @@ export async function buildOpenclawRuntimeBundle({
     await patchAgentPromptStreamFailureMarkers(prefix)
     await patchOpenclawLocalMediaAttachments(prefix)
     if (platform === 'win32') {
+      await patchWindowsNativeModuleRequire(prefix)
       await normalizeWindowsLayout(prefix)
     } else {
       await normalizeStagedLayout(prefix)
