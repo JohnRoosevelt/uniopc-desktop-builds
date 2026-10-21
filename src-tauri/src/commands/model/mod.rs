@@ -30,7 +30,7 @@ use self::types::{OpenClawGatewayStatus, OpenClawOfficialCatalogModel, ProviderA
 use self::{
     models::normalize_openclaw_model_ref,
     runtime::{
-        implementation::stop_gateway_for_profile_under_shutdown_guard, read_gateway_log_tail_impl,
+        implementation::stop_gateway_for_profile_under_shutdown_guard,
     },
 };
 
@@ -1184,13 +1184,6 @@ fn apply_local_profile_gateway_config(
     }
     changed |= apply_openclaw_profile_isolation_config(config);
     changed
-}
-
-fn ensure_managed_member_profile_local_gateway_config(
-    profile: &str,
-    gateway_port: u16,
-) -> Result<bool, String> {
-    ensure_local_profile_gateway_config(profile, gateway_port)
 }
 
 pub(crate) fn ensure_local_profile_gateway_config(
@@ -5190,6 +5183,7 @@ fn openclaw_gateway_patch_error_may_be_restarting(error: &str) -> bool {
         || normalized.contains("closed")
         || normalized.contains("connection reset")
         || normalized.contains("connection refused")
+        || normalized.contains("gateway_transport_connection_refused")
         || normalized.contains("gateway starting")
         || normalized.contains("retry shortly")
         || normalized.contains("timeout")
@@ -5243,23 +5237,22 @@ async fn wait_for_openclaw_profile_default_model(profile: Option<&str>, model_re
     false
 }
 
-async fn ensure_member_profile_provision_defaults(
-    _app: &AppHandle,
+pub(crate) fn startup_defaults_delta(
+    snapshot: &Value,
     profile: &str,
     cloud_agent_api_url: Option<&str>,
     cloud_agent_auth_token: Option<&str>,
     cloud_agent_token_expires_at: Option<&str>,
     cloud_agent_id: Option<&str>,
-) -> Result<(), String> {
-    // No leading gateway-ready wait here: every caller has either just verified
-    // the gateway is serving or already ran its own ready wait, and
-    // `config_get_with_gateway_recovery` retries through a still-booting
-    // gateway on its own. A second wait only ever stacked another 20s timeout
-    // onto the degraded path.
-    let snapshot = config_get_with_gateway_recovery(Some(profile)).await?;
+) -> Result<Value, String> {
+    use crate::services::startup_readiness::{minimal_delta, safe_config};
+    let config = safe_config(snapshot)?;
     let proxy_url = cloud_agent_proxy_url();
+    // Keep the engine envelope for builders that read parsed/sourceConfig, but
+    // use one canonical persisted snapshot for the delta comparison.
+    let canonical = serde_json::json!({"sourceConfig": config, "parsed": config});
     let patch = build_member_profile_hot_reload_config_patch(
-        &snapshot,
+        &canonical,
         profile,
         cloud_agent_api_url,
         cloud_agent_auth_token,
@@ -5267,29 +5260,7 @@ async fn ensure_member_profile_provision_defaults(
         cloud_agent_id,
         proxy_url.as_deref(),
     );
-    match openclaw_gateway::config_patch(Some(profile), patch).await {
-        Ok(_) => {
-            let _ = wait_for_openclaw_profile_default_model(
-                Some(profile),
-                OPENCLAW_UNIOPC_OFFICIAL_DEFAULT_MODEL,
-            )
-            .await;
-            Ok(())
-        }
-        Err(error) if openclaw_gateway_patch_error_may_be_restarting(&error) => {
-            if wait_for_openclaw_profile_default_model(
-                Some(profile),
-                OPENCLAW_UNIOPC_OFFICIAL_DEFAULT_MODEL,
-            )
-            .await
-            {
-                Ok(())
-            } else {
-                Err(error)
-            }
-        }
-        Err(error) => Err(error),
-    }
+    Ok(minimal_delta(config, &patch))
 }
 
 fn backup_file(path: &Path) -> Result<Option<PathBuf>, String> {
@@ -6819,424 +6790,78 @@ async fn openclaw_profile_provision_impl(
         }
         None => Err("profile provision requires a coordinated startup generation".to_string()),
     };
-
-    // Record the active account BEFORE any state/config/gateway work below, so
-    // every profile-less path (extensions, secrets, onboard workspace, the
-    // respawned gateway child) resolves to this account's `state/<key>`.
-    if let Err(error) = uniopc_runtime_paths::write_active_profile_key(&profile) {
-        return Err(format!("记录活跃账号失败: {error}"));
-    }
-
-    let cloud_agent_id = input
-        .cloud_agent_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("main");
-    let managed_member_profile = input.managed_member_profile;
-    let (gateway_port, gateway_url, dashboard_url) =
-        local_profile_gateway_urls_for_mode(&profile, input.gateway_port, managed_member_profile);
+    ensure_current()?;
+    uniopc_runtime_paths::write_active_profile_key(&profile)?;
+    let (gateway_port, gateway_url, dashboard_url) = local_profile_gateway_urls_for_mode(
+        &profile,
+        input.gateway_port,
+        input.managed_member_profile,
+    );
     let gateway_port_text = gateway_port.to_string();
-    let profile_config = openclaw_gateway::load_openclaw_config_for_profile(Some(&profile))
-        .map_err(|error| {
-            format!(
-                "读取 Uniopc 引擎 profile `{profile}` 配置失败，为防覆盖已停止自动修复: {error}"
-            )
-        })?;
-    let profile_is_initialized = openclaw_profile_config_is_initialized(&profile_config);
-
-    if profile_is_initialized {
-        let mut preflight_repair_output = String::new();
-        let configured_port_mismatch =
-            profile_gateway_port_mismatch(&profile, gateway_port, managed_member_profile);
-        match ensure_local_profile_gateway_config(&profile, gateway_port) {
-            Ok(true) => preflight_repair_output.push_str(&format!(
-                "Forced Uniopc 引擎 profile `{profile}` to local Gateway mode on port {gateway_port}.\n"
-            )),
-            Ok(false) => preflight_repair_output.push_str(&format!(
-                "Uniopc 引擎 profile `{profile}` already uses local Gateway mode on port {gateway_port}.\n"
-            )),
-            Err(error) => preflight_repair_output.push_str(&format!(
-                "Warning: failed to verify Uniopc 引擎 profile local Gateway config: {error}\n"
-            )),
-        }
-        let repaired_gateway_port = if let Some(configured_port) = configured_port_mismatch {
-            // Pure sidecar: the local gateway config was just rewritten to the
-            // expected port above; respawn the app-owned gateway child so it
-            // picks up the corrected config. No service metadata to reinstall.
-            use tauri::Manager;
-            ensure_current()?;
-            openclaw_system_plugins::prepare_system_plugins_before_gateway_spawn(&app, &profile)
-                .await?;
-            ensure_current()?;
-            match app.state::<GatewaySupervisor>().restart().await {
-                Ok(()) => preflight_repair_output.push_str(&format!(
-                    "Repaired Uniopc 引擎 profile `{profile}` gateway port: {configured_port} -> {gateway_port}.\n"
-                )),
-                Err(error) => preflight_repair_output.push_str(&format!(
-                    "Failed to repair Uniopc 引擎 profile `{profile}` gateway port {configured_port} -> {gateway_port}: {error}\n"
-                )),
-            }
-            true
-        } else {
-            false
-        };
-        // Direct WS health probe instead of `openclaw_profile_status`: the status
-        // command's offline path shells out to `openclaw gateway status --json`
-        // (a 1-3s Node boot) just to confirm what a refused loopback probe
-        // already told us. A healthy gateway answers this in milliseconds.
-        let gateway_rpc_ok = matches!(
-            timeout(
-                Duration::from_secs(OPENCLAW_PROFILE_STATUS_HEALTH_TIMEOUT_SECS),
-                openclaw_gateway::health(Some(&profile)),
-            )
-            .await,
-            Ok(Ok(value)) if value.get("ok").and_then(Value::as_bool).unwrap_or(true)
-        );
-
-        if !repaired_gateway_port && gateway_rpc_ok {
-            let host_name = local_host_name();
-            let mut refresh_output = preflight_repair_output;
-            match ensure_member_profile_provision_defaults(
-                &app,
+    let config = openclaw_gateway::load_openclaw_config_for_profile(Some(&profile))?;
+    // Provision owns only onboard and static isolation. The coordinator alone
+    // owns spawn, the startup budget and every post-ready config RPC.
+    let output = if !openclaw_profile_config_is_initialized(&config) {
+        // Pin the default agent workspace into our private state dir at setup time.
+        // Config `agents.defaults.workspace` (what onboard bakes here) is the ONLY
+        // lever that beats the engine's `<home>/.openclaw/workspace` default AND any
+        // stale value already baked on existing machines (env can't override a
+        // config value). Matches OPENCLAW_WORKSPACE_DIR in state_env_for_profile.
+        let workspace_dir =
+            crate::services::uniopc_runtime_paths::state_v8_dir_for_profile_or_active(Some(
                 &profile,
-                input.cloud_agent_api_url.as_deref(),
-                input.cloud_agent_auth_token.as_deref(),
-                input.cloud_agent_token_expires_at.as_deref(),
-                Some(cloud_agent_id),
-            )
-            .await
-            {
-                Ok(()) => refresh_output.push_str("Verified Uniopc 引擎 profile defaults.\n"),
-                Err(error) => refresh_output.push_str(&format!(
-                    "Warning: failed to refresh Uniopc 引擎 profile defaults: {error}\n"
-                )),
-            }
-            match openclaw_system_plugins::ensure_system_plugins_for_profile(&app, &profile).await {
-                Ok(()) => refresh_output.push_str("Verified Uniopc system plugins.\n"),
-                Err(error) => refresh_output.push_str(&format!(
-                    "Warning: failed to refresh Uniopc system plugins: {error}\n"
-                )),
-            }
-
-            emit_openclaw_progress(
-                &app,
-                OpenClawSetupProgress {
-                    phase: "provisioning_profile".to_string(),
-                    status: "Uniopc 引擎 profile Gateway 已在运行".to_string(),
-                    detail: Some(gateway_url.clone()),
-                    output_tail: Some(tail_lines(&refresh_output, 12))
-                        .filter(|value| !value.trim().is_empty()),
-                    percent: Some(100.0),
-                },
-            )?;
-
-            return Ok(OpenClawProfileProvisionResult {
-                profile,
-                host_name,
-                gateway_port,
-                gateway_url,
-                dashboard_url,
-                gateway_status: "online".to_string(),
-                output_tail: Some(tail_lines(&refresh_output, 12))
-                    .filter(|value| !value.trim().is_empty()),
-            });
-        }
-
-        emit_openclaw_progress(
-            &app,
-            OpenClawSetupProgress {
-                phase: "provisioning_profile".to_string(),
-                status: "正在恢复已有 Uniopc 引擎 profile Gateway".to_string(),
-                detail: Some(format!("profile: {profile}")),
-                output_tail: None,
-                percent: Some(15.0),
-            },
-        )?;
-
-        let mut repair_output = preflight_repair_output;
-        match ensure_profile_local_discovery_disabled(&profile) {
-            Ok(true) => {
-                repair_output.push_str(&format!(
-                    "Disabled local discovery for profile `{profile}`.\n"
-                ));
-            }
-            Ok(false) => {
-                repair_output.push_str(&format!(
-                    "Local discovery already disabled for profile `{profile}`.\n"
-                ));
-            }
-            Err(error) => {
-                repair_output.push_str(&format!(
-                    "Warning: failed to verify local discovery isolation: {error}\n"
-                ));
-            }
-        }
-
-        {
-            // Pure sidecar: respawn the app-owned gateway child to restore a
-            // configured-but-stopped profile (no service to restart).
-            use tauri::Manager;
-            ensure_current()?;
-            openclaw_system_plugins::prepare_system_plugins_before_gateway_spawn(&app, &profile)
-                .await?;
-            ensure_current()?;
-            match app.state::<GatewaySupervisor>().restart().await {
-                Ok(()) => repair_output.push_str("Respawned local Uniopc 引擎 gateway child.\n"),
-                Err(error) => {
-                    repair_output.push_str(&error);
-                    repair_output.push('\n');
-                }
-            }
-        }
-
-        if wait_for_openclaw_profile_gateway_ready(&profile).await {
-            ensure_member_profile_provision_defaults(
-                &app,
-                &profile,
-                input.cloud_agent_api_url.as_deref(),
-                input.cloud_agent_auth_token.as_deref(),
-                input.cloud_agent_token_expires_at.as_deref(),
-                Some(cloud_agent_id),
-            )
-            .await
-            .map_err(|error| {
-                format!("配置 Uniopc 引擎 profile `{profile}` 默认能力失败: {error}")
-            })?;
-            openclaw_system_plugins::ensure_system_plugins_for_profile(&app, &profile)
-                .await
-                .map_err(|error| {
-                    format!("配置 Uniopc 引擎 profile `{profile}` 内置系统插件失败: {error}")
-                })?;
-
-            emit_openclaw_progress(
-                &app,
-                OpenClawSetupProgress {
-                    phase: "provisioning_profile".to_string(),
-                    status: "Uniopc 引擎 profile Gateway 已恢复".to_string(),
-                    detail: Some(gateway_url.clone()),
-                    output_tail: Some(tail_lines(&repair_output, 24)),
-                    percent: Some(100.0),
-                },
-            )?;
-
-            return Ok(OpenClawProfileProvisionResult {
-                profile,
-                host_name: local_host_name(),
-                gateway_port,
-                gateway_url,
-                dashboard_url,
-                gateway_status: "online".to_string(),
-                output_tail: Some(tail_lines(&repair_output, 24)),
-            });
-        }
-
-        match read_gateway_log_tail_impl(Some(profile.clone()), 30) {
-            Ok(log) if log.exists => {
-                repair_output.push_str(&format!("Uniopc Gateway log: {}\n", log.path));
-                repair_output.push_str(&log.content);
-                repair_output.push('\n');
-            }
-            Ok(log) => {
-                repair_output.push_str(&format!("Uniopc Gateway log 尚未生成: {}\n", log.path))
-            }
-            Err(error) => {
-                repair_output.push_str(&format!("读取 Uniopc Gateway log 失败: {error}\n"))
-            }
-        }
-
-        let output_tail = tail_lines(&repair_output, 30);
-        emit_openclaw_progress(
-            &app,
-            OpenClawSetupProgress {
-                phase: "failed".to_string(),
-                status: "已有 Uniopc 引擎 profile Gateway 恢复失败".to_string(),
-                detail: Some(format!(
-                    "profile `{profile}` 已完成初始化，本次仅恢复 App 管理的 Gateway 子进程。"
-                )),
-                output_tail: Some(output_tail.clone()),
-                percent: Some(100.0),
-            },
-        )?;
-
-        return Err(format!(
-            "Uniopc 引擎 profile `{profile}` Gateway 恢复失败，请查看 App 管理的 Gateway 日志后重试。\n{}",
-            output_tail
-        ));
-    }
-
-    emit_openclaw_progress(
-        &app,
-        OpenClawSetupProgress {
-            phase: "provisioning_profile".to_string(),
-            status: "正在创建并启动 Uniopc 引擎 profile".to_string(),
-            detail: Some(format!("profile: {profile}")),
-            output_tail: None,
-            percent: Some(10.0),
-        },
-    )?;
-
-    if managed_member_profile {
-        ensure_managed_member_profile_local_gateway_config(&profile, gateway_port).map_err(
-            |error| {
-                format!("准备成员 Uniopc 引擎 profile `{profile}` 本机 Gateway 配置失败: {error}")
-            },
-        )?;
-    }
-
-    // Pin the default agent workspace into our private state dir at setup time.
-    // Config `agents.defaults.workspace` (what onboard bakes here) is the ONLY
-    // lever that beats the engine's `<home>/.openclaw/workspace` default AND any
-    // stale value already baked on existing machines (env can't override a
-    // config value). Matches OPENCLAW_WORKSPACE_DIR in state_env_for_profile.
-    let workspace_dir =
-        crate::services::uniopc_runtime_paths::state_v8_dir_for_profile_or_active(Some(&profile))
+            ))
             .map(|dir| dir.join("workspace").to_string_lossy().into_owned())
             .ok();
-    let mut onboard_args: Vec<&str> = vec![
-        "onboard",
-        "--non-interactive",
-        "--accept-risk",
-        "--auth-choice",
-        "skip",
-        "--mode",
-        "local",
-        "--flow",
-        "quickstart",
-        "--gateway-bind",
-        "loopback",
-        "--gateway-port",
-        gateway_port_text.as_str(),
-        // Pure sidecar: onboard writes config + gateway block (mode/bind/port) +
-        // workspace, but installs no system service. The gateway is spawned as an
-        // app-owned child by GatewaySupervisor::ensure_running (see
-        // openclaw_connection_start_local). OpenClaw 2026.8.1 otherwise waits
-        // for an already-running gateway here, which cannot exist yet.
-        "--skip-health",
-        "--skip-ui",
-        "--skip-channels",
-        "--skip-search",
-    ];
-    if let Some(workspace_dir) = workspace_dir.as_deref() {
-        onboard_args.push("--workspace");
-        onboard_args.push(workspace_dir);
-    }
-    let output = openclaw_output_for_profile(&app, &profile, &onboard_args)
-        .await
-        .map_err(|error| format!("创建或启动 Uniopc 引擎 profile `{profile}` 失败: {error}"))?;
-    match crate::commands::openclaw_plugins::cleanup_legacy_acpx_bridge_for_profile(&profile) {
-        Ok(true) => {
-            eprintln!("[uniopc] removed legacy ACPX bridge after onboarding profile {profile}")
+        let mut onboard_args: Vec<&str> = vec![
+            "onboard",
+            "--non-interactive",
+            "--accept-risk",
+            "--auth-choice",
+            "skip",
+            "--mode",
+            "local",
+            "--flow",
+            "quickstart",
+            "--gateway-bind",
+            "loopback",
+            "--gateway-port",
+            gateway_port_text.as_str(),
+            // Pure sidecar: onboard writes config + gateway block (mode/bind/port) +
+            // workspace, but installs no system service. The gateway is spawned as an
+            // app-owned child by GatewaySupervisor::ensure_running (see
+            // openclaw_connection_start_local). OpenClaw 2026.8.1 otherwise waits
+            // for an already-running gateway here, which cannot exist yet.
+            "--skip-health",
+            "--skip-ui",
+            "--skip-channels",
+            "--skip-search",
+        ];
+        if let Some(workspace_dir) = workspace_dir.as_deref() {
+            onboard_args.push("--workspace");
+            onboard_args.push(workspace_dir);
         }
-        Ok(false) => {}
-        Err(error) => {
-            return Err(format!(
-                "清理 Uniopc 引擎 profile `{profile}` 的遗留 ACPX 配置失败: {error}"
-            ));
-        }
-    }
-    let isolation_output = match ensure_profile_local_discovery_disabled(&profile) {
-        Ok(true) => format!("Disabled local discovery for profile `{profile}`."),
-        Ok(false) => format!("Local discovery already disabled for profile `{profile}`."),
-        Err(error) => {
-            return Err(format!(
-                "隔离 Uniopc 引擎 profile `{profile}` 本地发现失败: {error}"
-            ));
-        }
-    };
-
-    // Pure sidecar: onboard wrote config/workspace above; spawn the app-owned
-    // gateway child now (no service to install). Re-verify local-discovery
-    // isolation after the spawn, then wait for the RPC probe.
-    let start_output = {
-        use tauri::Manager;
         ensure_current()?;
-        openclaw_system_plugins::prepare_system_plugins_before_gateway_spawn(&app, &profile)
-            .await?;
-        ensure_current()?;
-        app.state::<GatewaySupervisor>()
-            .ensure_running()
+        let output = openclaw_output_for_profile(&app, &profile, &onboard_args)
             .await
-            .map_err(|error| {
-                format!("启动 Uniopc 引擎 profile `{profile}` Gateway 子进程失败: {error}")
-            })?;
-        "Respawned local Uniopc 引擎 gateway child.".to_string()
-    };
-    let post_install_isolation_output = match ensure_profile_local_discovery_disabled(&profile) {
-        Ok(true) => {
-            format!(
-                "Re-applied local discovery isolation after gateway start for profile `{profile}`."
-            )
-        }
-        Ok(false) => {
-            format!("Gateway start preserved local discovery isolation for profile `{profile}`.")
-        }
-        Err(error) => {
-            return Err(format!(
-                "校验 Uniopc 引擎 profile `{profile}` 本地发现隔离失败: {error}"
-            ));
-        }
-    };
-    let gateway_status = if wait_for_openclaw_profile_gateway_ready(&profile).await {
-        "online"
+            .map_err(|error| format!("创建或启动 Uniopc 引擎 profile `{profile}` 失败: {error}"))?;
+
+        output
     } else {
-        "degraded"
+        String::new()
     };
-    ensure_member_profile_provision_defaults(
-        &app,
-        &profile,
-        input.cloud_agent_api_url.as_deref(),
-        input.cloud_agent_auth_token.as_deref(),
-        input.cloud_agent_token_expires_at.as_deref(),
-        Some(cloud_agent_id),
-    )
-    .await
-    .map_err(|error| format!("配置成员 Uniopc 引擎 profile `{profile}` 默认能力失败: {error}"))?;
-    openclaw_system_plugins::ensure_system_plugins_for_profile(&app, &profile)
-        .await
-        .map_err(|error| {
-            format!("配置 Uniopc 引擎 profile `{profile}` 内置系统插件失败: {error}")
-        })?;
-    let isolation_verify_output = match ensure_profile_local_discovery_disabled(&profile) {
-        Ok(true) => format!("Re-applied local discovery isolation for profile `{profile}`."),
-        Ok(false) => format!("Verified local discovery isolation for profile `{profile}`."),
-        Err(error) => format!("Warning: failed to verify local discovery isolation: {error}"),
-    };
-    let default_model_output = format!(
-        "Configured default model and Cloud Workspace plugin for profile `{profile}`: {OPENCLAW_UNIOPC_OFFICIAL_DEFAULT_MODEL}"
-    );
-    let combined_output = [
-        output.as_str(),
-        isolation_output.as_str(),
-        start_output.as_str(),
-        post_install_isolation_output.as_str(),
-        isolation_verify_output.as_str(),
-        default_model_output.as_str(),
-    ]
-    .into_iter()
-    .filter(|item| !item.trim().is_empty())
-    .collect::<Vec<_>>()
-    .join("\n");
-
-    emit_openclaw_progress(
-        &app,
-        OpenClawSetupProgress {
-            phase: "provisioning_profile".to_string(),
-            status: "Uniopc 引擎 profile 已启动".to_string(),
-            detail: Some(gateway_url.clone()),
-            output_tail: Some(tail_lines(&combined_output, 24)),
-            percent: Some(100.0),
-        },
-    )?;
-
+    ensure_current()?;
+    crate::commands::openclaw_plugins::cleanup_legacy_acpx_bridge_for_profile(&profile)?;
+    ensure_current()?;
+    ensure_profile_local_discovery_disabled(&profile)?;
     Ok(OpenClawProfileProvisionResult {
         profile,
         host_name: local_host_name(),
         gateway_port,
         gateway_url,
         dashboard_url,
-        gateway_status: gateway_status.to_string(),
-        output_tail: Some(tail_lines(&combined_output, 24)),
+        gateway_status: "prepared".to_string(),
+        output_tail: Some(tail_lines(&output, 24)).filter(|s| !s.is_empty()),
     })
 }
 
@@ -7402,6 +7027,44 @@ async fn openclaw_profile_status_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_delta_preserves_custom_selection_and_never_replays_redacted_secrets() {
+        let config = serde_json::json!({
+            "agents":{"defaults":{"model":{"primary":"customer/model"},"models":{"customer/model":{"alias":"mine"}}}},
+            "tools":{"alsoAllow":["user-tool"]}, "plugins":{"entries":{"user-plugin":{"enabled":true}}},
+            "env":{"vars":{"USER":"keep","USER_TOKEN":"__OPENCLAW_REDACTED__","IMAI_CLOUD_AGENT_AUTH_TOKEN":"__OPENCLAW_REDACTED__"}}
+        });
+        let snapshot = serde_json::json!({"sourceConfig":config,"hash":"snapshot-one"});
+        let delta = startup_defaults_delta(&snapshot, "profile-a", None, Some("explicit-new-secret"), None, None).unwrap();
+        assert_eq!(delta.pointer("/agents/defaults/model/primary"), None);
+        assert_eq!(delta.get("tools"), None);
+        assert_eq!(delta.pointer("/plugins/entries/user-plugin"), None);
+        assert_eq!(delta.pointer("/env/vars/USER"), None);
+        assert_eq!(delta.pointer("/env/vars/USER_TOKEN"), None);
+        assert_eq!(delta.pointer("/env/vars/IMAI_CLOUD_AGENT_AUTH_TOKEN"), Some(&serde_json::json!("explicit-new-secret")));
+        assert!(!delta.to_string().contains("REDACTED"));
+        assert_eq!(delta.pointer("/agents/defaults/models/customer~1model"), None);
+    }
+
+    #[test]
+    fn startup_defaults_are_noop_once_actual_nonsecret_delta_is_present() {
+        let mut config = serde_json::json!({"agents":{"defaults":{"model":{"primary":"custom/model"}}}});
+        fn apply(target: &mut Value, patch: Value) {
+            if let Some(object) = patch.as_object() {
+                if !target.is_object() { *target = serde_json::json!({}); }
+                for (key, value) in object {
+                    if value.is_null() { target.as_object_mut().unwrap().remove(key); }
+                    else { apply(&mut target[key], value.clone()); }
+                }
+            } else { *target = patch; }
+        }
+        let delta = startup_defaults_delta(&serde_json::json!({"sourceConfig":config,"hash":"one"}), "profile-a", None, None, None, None).unwrap();
+        apply(&mut config, delta);
+        let warm = startup_defaults_delta(&serde_json::json!({"sourceConfig":config,"hash":"two"}), "profile-a", None, None, None, None).unwrap();
+        assert_eq!(warm, serde_json::json!({}));
+        assert_eq!(config.pointer("/agents/defaults/model/primary"), Some(&serde_json::json!("custom/model")));
+    }
 
     #[test]
     fn an_old_gateway_child_cannot_authorize_runtime_cleanup() {
@@ -10995,7 +10658,7 @@ mod tests {
     fn post_ready_call_chain_only_applies_the_hot_patch() {
         let source = include_str!("mod.rs");
         let start = source
-            .find("async fn ensure_member_profile_provision_defaults")
+            .find("pub(crate) fn startup_defaults_delta")
             .expect("post-ready defaults");
         let end = source[start..]
             .find("fn backup_file")
@@ -11156,21 +10819,15 @@ mod tests {
     }
 
     #[test]
-    fn existing_profile_recovery_forces_local_gateway_before_status_probe() {
+    fn profile_provision_leaves_gateway_lifecycle_and_rpcs_to_coordinator() {
         let source = include_str!("mod.rs");
-        let start = source
-            .find("if profile_is_initialized")
-            .expect("existing profile branch");
-        let end = source[start..]
-            .find("let repaired_gateway_port")
-            .map(|offset| start + offset)
-            .expect("port repair branch");
-        let preflight = &source[start..end];
-
-        assert!(preflight.contains("ensure_local_profile_gateway_config(&profile, gateway_port)"));
-        assert!(
-            !preflight.contains("if managed_member_profile || configured_port_mismatch.is_some()")
-        );
+        let provision = source.split("async fn openclaw_profile_provision_impl(").nth(1).unwrap()
+            .split("async fn openclaw_profile_status_impl(").next().unwrap();
+        assert!(provision.contains("openclaw_output_for_profile"));
+        assert!(provision.contains("ensure_profile_local_discovery_disabled"));
+        for forbidden in [".ensure_running", ".restart(", "wait_for_openclaw", "config_get(", "config_patch("] {
+            assert!(!provision.contains(forbidden), "provision must not own {forbidden}");
+        }
     }
 
     #[test]
@@ -11213,21 +10870,13 @@ mod tests {
     }
 
     #[test]
-    fn existing_profile_recovery_respawns_gateway_child_before_failing() {
-        let source = include_str!("mod.rs");
-        let start = source
-            .find("正在恢复已有 Uniopc 引擎 profile Gateway")
-            .expect("existing profile recovery branch");
-        let end = source[start..]
-            .find("已有 Uniopc 引擎 profile Gateway 恢复失败")
-            .map(|offset| start + offset)
-            .expect("failure branch");
-        let recovery = &source[start..end];
-
-        // Pure sidecar: recovery respawns the app-owned gateway child via the
-        // supervisor and waits for the RPC probe — no service install/repair.
-        assert!(recovery.contains("GatewaySupervisor>().restart().await"));
-        assert!(recovery.contains("wait_for_openclaw_profile_gateway_ready(&profile).await"));
+    fn local_startup_has_one_spawn_owner_and_common_postconditions() {
+        let source = include_str!("../../services/startup_readiness.rs");
+        let startup = source.split("pub async fn start<B: GatewayActivation>(").nth(1).unwrap()
+            .split("/// Dropping the future").next().unwrap();
+        assert_eq!(startup.matches("b.spawn()").count(), 1);
+        assert_eq!(startup.matches("finalize(b,").count(), 1);
+        assert!(!startup.contains("return Ok("), "warm and retry paths must not skip postconditions");
     }
 
     #[test]

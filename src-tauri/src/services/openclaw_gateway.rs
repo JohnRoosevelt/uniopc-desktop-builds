@@ -447,7 +447,7 @@ pub async fn config_patch_replacing(
     config_patch_with_retry(profile, patch, Some(replace_paths)).await
 }
 
-fn config_patch_conflict(error: &str) -> bool {
+pub(crate) fn config_patch_conflict(error: &str) -> bool {
     error == CONFIG_CHANGED_SINCE_LAST_LOAD
         || error
             .to_lowercase()
@@ -479,6 +479,21 @@ async fn config_patch_with_retry(
         }
     }
     Err(last_conflict.unwrap_or_else(|| "Uniopc 引擎 config.patch 重试失败。".to_string()))
+}
+
+/// Startup binds its delta to exactly the snapshot that produced it. Conflicts
+/// are returned to the caller so it can rebuild, never replay with a new hash.
+pub(crate) async fn startup_config_patch(profile: &str, snapshot: &Value, delta: Value) -> Result<(), String> {
+    let params = config_patch_params(snapshot, delta)?;
+    call_json(Some(profile), "config.patch", params, false).await.map(|_| ())
+}
+
+pub(crate) fn transport_error(error: &tokio_tungstenite::tungstenite::Error) -> String {
+    if matches!(error, tokio_tungstenite::tungstenite::Error::Io(io) if io.kind() == std::io::ErrorKind::ConnectionRefused) {
+        "gateway_transport_connection_refused".to_string()
+    } else {
+        format!("连接 Uniopc 引擎 失败: {error}")
+    }
 }
 
 fn config_patch_params(snapshot: &Value, patch: Value) -> Result<Value, String> {
@@ -525,8 +540,15 @@ pub async fn http_ready_for_endpoint(endpoint: &GatewayEndpoint) -> Result<bool,
         .get(&url)
         .send()
         .await
-        .map_err(|error| format!("引擎 /readyz 探测失败: {error}"))?;
-    Ok(response.status().is_success())
+        .map_err(|error| {
+            if error.is_connect() || error.is_timeout() {
+                "gateway_transport_unavailable".to_string()
+            } else { "gateway_http_readiness_failed".to_string() }
+        })?;
+    if !response.status().is_success() { return Ok(false); }
+    let body = response.json::<Value>().await
+        .map_err(|_| "gateway_http_readiness_schema_invalid".to_string())?;
+    Ok(body.get("ready").and_then(Value::as_bool) == Some(true))
 }
 
 fn http_base_from_ws_url(url: &str) -> String {
@@ -941,7 +963,7 @@ pub(crate) async fn connect_endpoint_socket(
     )
     .await
     .map_err(|_| format!("连接 Uniopc 引擎 超时: {}", endpoint.url))?
-    .map_err(|e| format!("连接 Uniopc 引擎 失败: {e}"))?;
+    .map_err(|e| transport_error(&e))?;
 
     let challenge = next_text_frame(&mut socket, connect_timeout_secs)
         .await
@@ -1009,7 +1031,7 @@ pub(crate) async fn connect_endpoint_socket_with_device_auth<R: Runtime>(
     )
     .await
     .map_err(|_| format!("连接 Uniopc 引擎 超时: {}", endpoint.url))?
-    .map_err(|e| format!("连接 Uniopc 引擎 失败: {e}"))?;
+    .map_err(|e| transport_error(&e))?;
 
     let challenge = next_text_frame(&mut socket, connect_timeout_secs)
         .await
@@ -2022,6 +2044,36 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
     use tokio_tungstenite::accept_async;
+
+    #[tokio::test]
+    async fn http_readiness_requires_literal_ready_true() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (body, expected) in [(r#"{"ready":false}"#, false), (r#"{"ready":true}"#, true), (r#"{"ok":true}"#, false)] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buffer = [0u8; 4096];
+                socket.read(&mut buffer).await.unwrap();
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                socket.write_all(response.as_bytes()).await.unwrap();
+            });
+            let endpoint = GatewayEndpoint { url: format!("ws://127.0.0.1:{port}"), token: None, password: None, device_token: None };
+            assert_eq!(http_ready_for_endpoint(&endpoint).await.unwrap(), expected);
+            server.await.unwrap();
+        }
+    }
+
+    #[test]
+    fn localized_connection_refused_uses_stable_recoverable_code() {
+        let io = std::io::Error::new(std::io::ErrorKind::ConnectionRefused,
+            "由于目标计算机积极拒绝，无法连接。(os error 10061)");
+        let error = transport_error(&tokio_tungstenite::tungstenite::Error::Io(io));
+        assert_eq!(error, "gateway_transport_connection_refused");
+        assert!(crate::services::startup_readiness::transient(&error));
+        assert!(!crate::services::startup_readiness::transient("unauthorized password_mismatch"));
+        assert!(!crate::services::startup_readiness::transient("invalid schema"));
+    }
 
     #[test]
     fn legacy_config_and_backups_migrate_without_overwriting_new_files() {

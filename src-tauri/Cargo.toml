@@ -63,4 +63,5 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Network
 block2 = "0.6"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 tauri = { version = "2", features = ["test", "unstable"] }

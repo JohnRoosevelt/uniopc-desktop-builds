@@ -16,75 +16,183 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
 
-// A Windows OpenClaw 8.1 cold start can take 82-87s before its HTTP listener
-// exists (and roughly two minutes from process spawn on a loaded machine).
-// Keep the UI in its non-destructive "preparing" state while cheaply probing
-// that condition, rather than publishing a false connection-refused failure.
-// Loaded Windows VMs also spend minutes loading plugins. Keep a bounded
-// fifteen-minute Windows allowance, but stop immediately if the owned child exits.
-// The non-Windows three-minute cap remains unchanged, and
-// the 250ms cadence avoids adding visible delay once the listener is ready.
 #[cfg(windows)]
-const START_LOCAL_SETTLE_PROBE_DELAYS_MS: &[u64] = &[250; 3600];
+const GATEWAY_STARTUP_BUDGET: Duration = Duration::from_secs(900);
 #[cfg(not(windows))]
-const START_LOCAL_SETTLE_PROBE_DELAYS_MS: &[u64] = &[250; 720];
+const GATEWAY_STARTUP_BUDGET: Duration = Duration::from_secs(180);
 
-// The gateway process is already up (or a provision just ran) but the port may
-// still be binding; a probe taken before that finishes reads "connection
-// refused" even though no repair is needed. Re-probe briefly so that stale
-// pre-boot snapshot never becomes the caller's final answer.
-async fn settle_local_connection_snapshot(
-    app: &AppHandle,
-    config: &GatewayConnectionConfig,
-    profile: &str,
-    initial_snapshot: GatewayConnectionSnapshot,
+struct LocalStartupBackend<'a> {
+    app: &'a AppHandle,
+    config: std::sync::Mutex<GatewayConnectionConfig>,
+    input: &'a GatewayConnectionProfileInput,
     generation: u64,
-) -> Result<GatewayConnectionSnapshot, String> {
-    let mut snapshot = initial_snapshot;
-    // A hung HTTP/WS peer must not multiply the startup allowance by the
-    // number of polls. The same deadline bounds sleeps and both network probes.
-    let deadline = tokio::time::Instant::now()
-        + Duration::from_millis(START_LOCAL_SETTLE_PROBE_DELAYS_MS.iter().sum());
-    for delay_ms in START_LOCAL_SETTLE_PROBE_DELAYS_MS {
-        local_gateway_lifecycle().check(generation)?;
-        if snapshot.status == GatewayConnectionStatus::Connected {
-            return Ok(snapshot);
-        }
-        if !app.state::<model::GatewaySupervisor>().is_running().await {
-            return Ok(snapshot);
-        }
-        if tokio::time::timeout_at(deadline, tokio::time::sleep(Duration::from_millis(*delay_ms)))
-            .await.is_err()
-        {
-            break;
-        }
-        local_gateway_lifecycle().check(generation)?;
-        let openclaw_config =
-            openclaw_gateway::load_openclaw_config_for_profile(Some(profile)).ok();
-        if let Ok(resolved) =
-            resolve_effective_connection_endpoint(config, openclaw_config.as_ref(), None)
-        {
-            let ready = match tokio::time::timeout_at(
-                deadline, openclaw_gateway::http_ready_for_endpoint(&resolved.endpoint),
-            ).await {
-                Ok(ready) => ready,
-                Err(_) => break,
-            };
-            local_gateway_lifecycle().check(generation)?;
-            if !matches!(ready, Ok(true)) {
-                continue;
-            }
-        }
-        snapshot = match tokio::time::timeout_at(
-            deadline, probe_effective_connection_snapshot(app, config, openclaw_config.as_ref()),
-        ).await {
-            Ok(snapshot) => snapshot,
-            Err(_) => break,
-        };
-        local_gateway_lifecycle().check(generation)?;
+    flight: &'a crate::services::startup_coordinator::StartupFlightContext,
+    provision_count: &'a AtomicU64,
+    phases: std::sync::Mutex<std::collections::HashSet<(String, bool)>>,
+}
+impl LocalStartupBackend<'_> {
+    fn config(&self) -> GatewayConnectionConfig {
+        self.config
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
-    local_gateway_lifecycle().check(generation)?;
-    Ok(snapshot)
+}
+impl crate::services::startup_readiness::GatewayStartup for LocalStartupBackend<'_> {
+    type Snapshot = GatewayConnectionSnapshot;
+    fn check(&self) -> Result<(), String> {
+        self.flight.checkpoint()?;
+        local_gateway_lifecycle().check(self.generation)
+    }
+    async fn child_running(&self) -> bool {
+        self.app
+            .state::<model::GatewaySupervisor>()
+            .is_running()
+            .await
+    }
+    async fn http_ready(&self) -> Result<bool, String> {
+        let config = self.config();
+        let root = openclaw_gateway::load_openclaw_config_for_profile(Some(&config.profile))?;
+        let resolved = resolve_effective_connection_endpoint(&config, Some(&root), None)?;
+        openclaw_gateway::http_ready_for_endpoint(&resolved.endpoint).await
+    }
+    async fn auth_ready(&self) -> Result<Option<Self::Snapshot>, String> {
+        let config = self.config();
+        let root = openclaw_gateway::load_openclaw_config_for_profile(Some(&config.profile))?;
+        let snapshot = probe_effective_connection_snapshot(self.app, &config, Some(&root)).await;
+        if snapshot.status == GatewayConnectionStatus::Connected {
+            Ok(Some(snapshot))
+        } else if let Some(error) = snapshot.last_error {
+            Err(error)
+        } else {
+            Ok(None)
+        }
+    }
+    async fn config_get(&self) -> Result<Value, String> {
+        openclaw_gateway::config_get(Some(&self.config().profile)).await
+    }
+    fn defaults_patch(&self, snapshot: &Value) -> Result<Value, String> {
+        model::startup_defaults_delta(
+            snapshot,
+            &self.config().profile,
+            self.input.cloud_agent_api_url.as_deref(),
+            self.input.cloud_agent_auth_token.as_deref(),
+            self.input.cloud_agent_token_expires_at.as_deref(),
+            self.input.cloud_agent_id.as_deref(),
+        )
+    }
+    async fn config_patch(&self, snapshot: &Value, delta: Value) -> Result<(), String> {
+        openclaw_gateway::startup_config_patch(&self.config().profile, snapshot, delta).await
+    }
+    fn contains_explicit_secret(&self, delta: &Value) -> bool {
+        self.input
+            .cloud_agent_auth_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .is_some_and(|secret| {
+                delta
+                    .pointer("/env/vars/IMAI_CLOUD_AGENT_AUTH_TOKEN")
+                    .and_then(Value::as_str)
+                    == Some(secret)
+            })
+    }
+    async fn verify_plugins(&self) -> Result<(), String> {
+        crate::services::openclaw_system_plugins::ensure_system_plugins_for_profile(
+            self.app,
+            &self.config().profile,
+        )
+        .await
+    }
+    fn phase(&self, phase: &str, elapsed: Duration, count: usize) {
+        // Readonly transport recovery can revisit readiness many times. Keep
+        // disk-backed phase telemetry at most once per boundary per flight.
+        if !self
+            .phases
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((phase.to_string(), count == 0))
+        {
+            return;
+        }
+        crate::services::engine_startup_metrics::record_startup_event(
+            self.app,
+            &self.config().profile,
+            phase,
+            if count == 0 { "started" } else { "completed" },
+            elapsed.as_millis().try_into().unwrap_or(u64::MAX),
+            Some(format!("count={count}")),
+        );
+    }
+}
+impl crate::services::startup_readiness::GatewayActivation for LocalStartupBackend<'_> {
+    async fn stop_and_reclaim(&self) -> Result<(), String> {
+        use crate::services::startup_readiness::GatewayStartup;
+        self.check()?;
+        self.app.state::<model::GatewaySupervisor>().stop().await;
+        self.check()?;
+        model::reclaim_orphan_engines_before_start()
+    }
+    async fn onboard(&self) -> Result<(), String> {
+        use crate::services::startup_readiness::GatewayStartup;
+        self.check()?;
+        self.provision_count.fetch_add(1, Ordering::SeqCst);
+        let config = self.config();
+        let provision = model::openclaw_profile_provision(
+            self.app.clone(),
+            model::OpenClawProfileProvisionRequest {
+                profile: config.profile,
+                gateway_port: Some(config.local_port),
+                managed_member_profile: false,
+                cloud_agent_api_url: self.input.cloud_agent_api_url.clone(),
+                cloud_agent_auth_token: self.input.cloud_agent_auth_token.clone(),
+                cloud_agent_token_expires_at: self.input.cloud_agent_token_expires_at.clone(),
+                cloud_agent_id: self.input.cloud_agent_id.clone(),
+                startup_generation: Some(self.generation),
+            },
+        )
+        .await?;
+        self.check()?;
+        self.config
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .local_port = provision.gateway_port;
+        Ok(())
+    }
+    async fn prepare_spawn(&self) -> Result<(), String> {
+        use crate::services::startup_readiness::GatewayStartup;
+        let config = self.config();
+        self.check()?;
+        crate::commands::openclaw_plugins::cleanup_legacy_acpx_bridge_for_profile(&config.profile)?;
+        self.check()?;
+        save_openclaw_gateway_config_patch(
+            &config.profile,
+            local_openclaw_gateway_config_patch(&config.profile, config.local_port),
+        )?;
+        self.check()?;
+        crate::services::openclaw_system_plugins::prepare_system_plugins_before_gateway_spawn(
+            self.app,
+            &config.profile,
+        )
+        .await
+    }
+    async fn spawn(&self) -> Result<(), String> {
+        use crate::services::startup_readiness::GatewayStartup;
+        self.check()?;
+        self.app
+            .state::<model::GatewaySupervisor>()
+            .ensure_running_for(&self.config().profile)
+            .await
+    }
+    fn auth_repair_needed(&self, error: &str) -> bool {
+        let snapshot = GatewayConnectionSnapshot::from_config(
+            &self.config(),
+            GatewayConnectionStatus::Unavailable,
+            None,
+            Some(error.to_string()),
+        );
+        local_gateway_auth_repair_needed(&snapshot)
+    }
 }
 
 #[derive(Default)]
@@ -1074,286 +1182,68 @@ async fn openclaw_connection_start_local_for_profile(
     metrics: &mut EngineStartupTiming,
     provision_count: &AtomicU64,
 ) -> Result<GatewayConnectionSnapshot, String> {
-    // StartupCoordinator owns the complete inspect → repair → spawn gate. This
-    // function runs only for its elected leader; joiners share its result.
+    use crate::services::startup_readiness;
     metrics.lock_wait_ms = elapsed_ms(started_at);
-    flight.checkpoint()?;
-    local_gateway_lifecycle().check(generation)?;
-    // This gate excludes runtime preparation. It covers the complete lifetime
-    // of provisioning (including its internal config writes and respawns), so
-    // logout cleans up only after those operations have finished.
-    let _mutation_guard = local_gateway_lifecycle().lock_current(generation).await?;
     let ensure_current = || {
         flight.checkpoint()?;
         local_gateway_lifecycle().check(generation)
     };
+    ensure_current()?;
+    let _mutation_guard = local_gateway_lifecycle().lock_current(generation).await?;
     let preflight_started_at = Instant::now();
-    crate::services::engine_startup_metrics::record_startup_event(
-        &app,
-        &profile,
-        "gateway_preflight",
-        "started",
-        elapsed_ms(started_at),
-        None,
-    );
-    // Per-account isolation: mark this the active account up front so BOTH the
-    // full-provision path and the "already set up, just respawn" fast path below
-    // resolve `state/<key>` for this profile (not a previously-active account).
-    // provision() records it too; setting it here also covers the fast path that
-    // never calls provision.
-    if !profile.trim().is_empty() {
-        if let Err(error) = crate::services::uniopc_runtime_paths::write_active_profile_key(&profile)
-        {
-            eprintln!("[uniopc] record active profile {profile} failed: {error}");
-        }
-    }
-    let mut config = local_config_for_profile(&profile);
+    crate::services::uniopc_runtime_paths::write_active_profile_key(&profile)?;
+    let config = local_config_for_profile(&profile);
     app.state::<GatewayTunnelSupervisor>().stop().await;
     ensure_current()?;
-    let existing_openclaw_config =
-        openclaw_gateway::load_openclaw_config_for_profile(Some(&profile)).map_err(|error| {
-            format!("读取 Uniopc 引擎 profile `{profile}` 配置失败，为防覆盖已停止自动修复: {error}")
-        })?;
-    let profile_is_set_up =
-        model::openclaw_profile_config_is_initialized(&existing_openclaw_config);
-    if profile_is_set_up {
-        match crate::commands::openclaw_plugins::cleanup_legacy_acpx_bridge_for_profile(&profile)
-        {
-            Ok(true) => eprintln!(
-                "[uniopc] removed legacy ACPX bridge before Gateway start for profile {profile}"
-            ),
-            Ok(false) => {}
-            Err(error) => eprintln!(
-                "[uniopc] legacy ACPX bridge cleanup skipped for profile {profile}: {error}"
-            ),
-        }
-    }
-    // Never create a gateway-only config before deciding profile completeness:
-    // that stub used to make a fresh/partial profile look "existing" and skip
-    // the onboard command responsible for config and database migration.
-    if profile_is_set_up {
-        save_openclaw_gateway_config_patch(
-            &profile,
-            local_openclaw_gateway_config_patch(&config.profile, config.local_port),
-        )?;
-    }
-    let openclaw_config = if profile_is_set_up {
-        openclaw_gateway::load_openclaw_config_for_profile(Some(&profile)).ok()
-    } else {
-        Some(existing_openclaw_config)
-    };
-    // Pure sidecar: the only local gateway is the supervisor's own child, so the
-    // supervisor already knows everything a status probe could tell us. The old
-    // `openclaw_profile_status` call here fell back to `openclaw gateway status
-    // --json` — a 1-3s Node boot, serial on every cold start — to report the
-    // "offline" we could read from `is_running()` for free.
+    let existing = openclaw_gateway::load_openclaw_config_for_profile(Some(&profile))
+        .map_err(|_| "gateway_startup_profile_config_read_failed".to_string())?;
+    let profile_is_set_up = model::openclaw_profile_config_is_initialized(&existing);
     let supervisor = app.state::<model::GatewaySupervisor>();
-    if !profile_is_set_up {
-        // Onboard and state-schema migration must never race an old child that
-        // is reading the same profile, nor a singleton child for another one.
-        supervisor.stop().await;
-        ensure_current()?;
-    }
     let running_profile = supervisor.running_profile().await;
+    let running = supervisor.is_running().await;
+    let engine_matches_profile =
+        owned_engine_matches_profile(&profile, running_profile.as_deref(), running)
+            && supervisor.running_runtime_matches_active().await;
     ensure_current()?;
-    // A live child spawned for ANOTHER account must not be reused (its state env
-    // is frozen at spawn): fall through to `ensure_running_for`, which respawns.
-    let initial_snapshot =
-        probe_effective_connection_snapshot(&app, &config, openclaw_config.as_ref()).await;
-    ensure_current()?;
-    let engine_is_running = supervisor.is_running().await;
-    ensure_current()?;
-    let engine_matches_runtime = supervisor.running_runtime_matches_active().await;
-    ensure_current()?;
-    let engine_matches_profile = owned_engine_matches_profile(&profile, running_profile.as_deref(), engine_is_running)
-        && engine_matches_runtime;
+    metrics.cold_start = !engine_matches_profile;
     metrics.preflight_ms = elapsed_ms(preflight_started_at);
-    metrics.cold_start = running_profile.is_none() || !engine_is_running;
-    crate::services::engine_startup_metrics::record_startup_event(
-        &app,
-        &profile,
-        "gateway_preflight",
-        if initial_snapshot.status == GatewayConnectionStatus::Connected { "connected" } else { "not_ready" },
-        elapsed_ms(started_at),
-        Some(format!(
-            "profile_initialized={profile_is_set_up}; child_running={engine_is_running}; child_profile_and_runtime_match={engine_matches_profile}; child_runtime_matches_active={engine_matches_runtime}; status={:?}; endpoint={}; cause={}",
-            initial_snapshot.status,
-            initial_snapshot.endpoint_url.as_deref().unwrap_or("unknown"),
-            initial_snapshot.last_error.as_deref().unwrap_or("none")
-        )),
-    );
-    if profile_is_set_up
-        && initial_snapshot.status == GatewayConnectionStatus::Connected
-        && engine_matches_profile
-    {
-        return Ok(initial_snapshot);
-    }
-    let auth_repair_needed = local_gateway_auth_repair_needed(&initial_snapshot);
-    // Child alive for this profile but not answering yet → it is still booting;
-    // just wait for it to settle instead of respawning or provisioning.
-    if profile_is_set_up
-        && engine_matches_profile
-        && engine_is_running
-        && !auth_repair_needed
-    {
-        let ready_started_at = Instant::now();
-        crate::services::engine_startup_metrics::record_startup_event(
-            &app,
-            &profile,
-            "gateway_readiness_wait",
-            "started",
-            elapsed_ms(started_at),
-            Some("existing Gateway child is alive but not ready".to_string()),
-        );
-        let snapshot =
-            settle_local_connection_snapshot(&app, &config, &profile, initial_snapshot, generation).await?;
-        metrics.gateway_ready_ms = elapsed_ms(ready_started_at);
-        return Ok(snapshot);
-    }
-    // Pure sidecar: a profile that is already set up (config has an agent) whose
-    // gateway child simply isn't running — killed on the last app quit — only
-    // needs the child respawned, not a full re-provision. Skips onboard churn on
-    // every launch. (Fresh profiles / auth repair fall through to provision.)
-    if profile_is_set_up && !auth_repair_needed {
-        let spawn_started_at = Instant::now();
-        crate::services::engine_startup_metrics::record_startup_event(
-            &app,
-            &profile,
-            "gateway_spawn",
-            "started",
-            elapsed_ms(started_at),
-            Some("reusing initialized profile".to_string()),
-        );
-        ensure_current()?;
-        crate::services::openclaw_system_plugins::prepare_system_plugins_before_gateway_spawn(
-            &app,
-            &profile,
-        )
-        .await?;
-        ensure_current()?;
-        supervisor.ensure_running_for(&profile).await?;
-        ensure_current()?;
-        metrics.gateway_spawn_ms = Some(elapsed_ms(spawn_started_at));
-        crate::services::engine_startup_metrics::record_startup_event(
-            &app,
-            &profile,
-            "gateway_spawn",
-            "spawned",
-            elapsed_ms(started_at),
-            None,
-        );
-        let ready_started_at = Instant::now();
-        // Reclamation/spawn invalidates the pre-spawn snapshot, even if an
-        // unowned process previously answered health on that endpoint.
-        let fresh_snapshot = probe_effective_connection_snapshot(&app, &config, openclaw_config.as_ref()).await;
-        ensure_current()?;
-        crate::services::engine_startup_metrics::record_startup_event(
-            &app,
-            &profile,
-            "gateway_first_probe",
-            if fresh_snapshot.status == GatewayConnectionStatus::Connected { "connected" } else { "not_ready" },
-            elapsed_ms(started_at),
-            fresh_snapshot.last_error.clone(),
-        );
-        let snapshot =
-            settle_local_connection_snapshot(&app, &config, &profile, fresh_snapshot, generation).await?;
-        metrics.gateway_ready_ms = elapsed_ms(ready_started_at);
-        return Ok(snapshot);
-    }
-
-    ensure_current()?;
-    // Onboard/auth repair must not race either our child or an orphan that
-    // still writes this profile. Reclaim under the owning startup/lifecycle
-    // gates before provisioning, rather than in an independent background task.
-    supervisor.stop().await;
-    ensure_current()?;
-    model::reclaim_orphan_engines_before_start()?;
-    ensure_current()?;
-    provision_count.fetch_add(1, Ordering::SeqCst);
-    crate::services::engine_startup_metrics::record_startup_event(
-        &app,
-        &profile,
-        "profile_provision",
-        "started",
-        elapsed_ms(started_at),
-        None,
-    );
-    let provision = model::openclaw_profile_provision(
-        app.clone(),
-        model::OpenClawProfileProvisionRequest {
-            profile: profile.clone(),
-            gateway_port: Some(config.local_port),
-            managed_member_profile: false,
-            cloud_agent_api_url: input.cloud_agent_api_url,
-            cloud_agent_auth_token: input.cloud_agent_auth_token,
-            cloud_agent_token_expires_at: input.cloud_agent_token_expires_at,
-            cloud_agent_id: input.cloud_agent_id,
-            startup_generation: Some(generation),
-        },
-    )
-    .await?;
-    ensure_current()?;
-    crate::services::engine_startup_metrics::record_startup_event(
-        &app,
-        &profile,
-        "profile_provision",
-        "completed",
-        elapsed_ms(started_at),
-        Some(format!("gateway_port={}", provision.gateway_port)),
-    );
-    config.local_port = provision.gateway_port;
-    let profile = config.profile.clone();
-    save_openclaw_gateway_config_patch(
-        &profile,
-        local_openclaw_gateway_config_patch(&config.profile, config.local_port),
-    )?;
-    let openclaw_config = openclaw_gateway::load_openclaw_config_for_profile(Some(&profile)).ok();
-    // Pure sidecar: onboard wrote the config (no system service installed);
-    // spawn the app-owned gateway child now, then let the connection settle.
-    let spawn_started_at = Instant::now();
-    crate::services::engine_startup_metrics::record_startup_event(
-        &app,
-        &profile,
-        "gateway_spawn",
-        "started",
-        elapsed_ms(started_at),
-        Some("spawn after profile provisioning".to_string()),
-    );
-    app.state::<model::GatewaySupervisor>()
-        .ensure_running_for(&profile)
-        .await?;
-    ensure_current()?;
-    metrics.gateway_spawn_ms = Some(elapsed_ms(spawn_started_at));
-    crate::services::engine_startup_metrics::record_startup_event(
-        &app,
-        &profile,
-        "gateway_spawn",
-        "spawned",
-        elapsed_ms(started_at),
-        None,
-    );
-    let ready_started_at = Instant::now();
-    let first_snapshot =
-        probe_effective_connection_snapshot(&app, &config, openclaw_config.as_ref()).await;
-    crate::services::engine_startup_metrics::record_startup_event(
-        &app,
-        &profile,
-        "gateway_first_probe",
-        if first_snapshot.status == GatewayConnectionStatus::Connected { "connected" } else { "not_ready" },
-        elapsed_ms(started_at),
-        first_snapshot.last_error.clone(),
-    );
-    let snapshot = settle_local_connection_snapshot(
-        &app,
-        &config,
-        &profile,
-        first_snapshot,
+    let backend = LocalStartupBackend {
+        app: &app,
+        config: std::sync::Mutex::new(config),
+        input: &input,
         generation,
+        flight,
+        provision_count,
+        phases: Default::default(),
+    };
+    // Production and tests share activation branch selection, onboard/spawn
+    // ownership, the deadline, and every postcondition through this entrypoint.
+    let result = startup_readiness::start(
+        &backend,
+        profile_is_set_up,
+        engine_matches_profile,
+        GATEWAY_STARTUP_BUDGET,
     )
     .await?;
-    metrics.gateway_ready_ms = elapsed_ms(ready_started_at);
-    Ok(snapshot)
+    ensure_current()?;
+    metrics.preflight_ms = metrics.preflight_ms.saturating_add(
+        result
+            .preflight_elapsed
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX),
+    );
+    metrics.gateway_spawn_ms = result
+        .spawn_elapsed
+        .map(|d| d.as_millis().try_into().unwrap_or(u64::MAX));
+    metrics.gateway_ready_ms = result
+        .ready_elapsed
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    Ok(result.snapshot)
 }
+
 
 pub async fn openclaw_connection_start_local_for_runtime(
     app: AppHandle,
@@ -1904,36 +1794,10 @@ mod tests {
     }
 
     #[test]
-    fn local_gateway_settle_budget_covers_slow_windows_cold_start() {
-        assert!(
-            START_LOCAL_SETTLE_PROBE_DELAYS_MS.iter().sum::<u64>() >= 120_000,
-            "cold-start settle budget must cover the observed 82-87s Windows Gateway boot with margin"
-        );
-    }
-
-    #[test]
-    fn local_gateway_settle_detects_readiness_without_seconds_of_backoff() {
-        // Engines can become ready anywhere in the startup window, including
-        // a slow disk's tail. Detection should never add seconds of UI delay.
-        for ready_at_ms in [340, 6_700, 9_600, 14_100, 90_000] {
-            let mut elapsed_ms = 0;
-            for delay in START_LOCAL_SETTLE_PROBE_DELAYS_MS {
-                elapsed_ms += delay;
-                if elapsed_ms >= ready_at_ms {
-                    break;
-                }
-            }
-            assert!(elapsed_ms >= ready_at_ms);
-            assert!(elapsed_ms - ready_at_ms <= 250,
-                "ready at {ready_at_ms}ms but next probe is at {elapsed_ms}ms");
-        }
-    }
-
-    #[test]
     fn local_gateway_start_inspects_profile_before_writing_gateway_config() {
         let source = include_str!("openclaw_connection.rs");
         let start = source
-            .find("pub async fn openclaw_connection_start_local(")
+            .find("async fn openclaw_connection_start_local_for_profile(")
             .expect("local gateway start command");
         let end = source[start..]
             .find("pub async fn openclaw_connection_start_local_for_runtime")
@@ -1943,14 +1807,8 @@ mod tests {
         let inspect = command
             .find("openclaw_profile_config_is_initialized")
             .expect("semantic profile inspection");
-        let gateway_write = command
-            .find("save_openclaw_gateway_config_patch")
-            .expect("gateway config write");
-
-        assert!(inspect < gateway_write);
-        assert!(command.contains("if profile_is_set_up"));
-        assert!(command.contains("if !profile_is_set_up"));
-        assert!(command.contains("supervisor.stop().await"));
+        let dispatch = command.find("startup_readiness::start(").expect("shared production activation");
+        assert!(inspect < dispatch, "classify completeness before any activation mutation");
     }
 
     #[test]

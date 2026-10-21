@@ -31,6 +31,7 @@ pub mod openclaw_windows_runtime;
 pub mod plugin_artifact;
 pub mod plugin_consent;
 pub mod startup_coordinator;
+pub mod startup_readiness;
 pub mod tool_artifacts;
 pub mod uniopc_runtime_paths;
 pub mod white_label;
