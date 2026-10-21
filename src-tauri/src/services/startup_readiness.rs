@@ -454,6 +454,7 @@ mod tests {
         replacement_ready: bool,
         recovery_error: Option<&'static str>,
         recoveries: std::sync::atomic::AtomicUsize,
+        recovery_full_verifications: std::sync::atomic::AtomicUsize,
         state: Mutex<State>,
     }
     impl Fake {
@@ -473,6 +474,7 @@ mod tests {
                 http_errors: std::sync::atomic::AtomicUsize::new(0),
                 recovery: false, replacement_ready: true, recovery_error: None,
                 recoveries: std::sync::atomic::AtomicUsize::new(0),
+                recovery_full_verifications: std::sync::atomic::AtomicUsize::new(0),
                 state: Mutex::new(State {
                     config: json!({}),
                     revision: 1,
@@ -508,14 +510,43 @@ mod tests {
             }
         }
         async fn recover_stalled(&self, deadline: Instant) -> Result<bool, String> {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if self.recovery && self.began.elapsed() >= Duration::from_secs(360) && remaining >= Duration::from_secs(300)
-                && self.recoveries.compare_exchange(0, 1, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst).is_ok() {
-                if let Some(error) = self.recovery_error { return Err(error.into()); }
-                self.state.lock().unwrap().spawns += 1;
-                return Ok(true);
+            use crate::services::gateway_startup_progress::{poll_recovery, RecoveryPoll};
+            use std::sync::atomic::Ordering::SeqCst;
+            struct Poll<'a>(&'a Fake, Instant);
+            impl RecoveryPoll for Poll<'_> {
+                fn check_identity(&mut self) -> Result<bool, String> {
+                    self.0.check()?;
+                    Ok(self.0.state.lock().unwrap().running)
+                }
+                fn eligible(&self) -> bool {
+                    self.0.recovery
+                        && self.0.began.elapsed() >= Duration::from_secs(360)
+                        && self.1.saturating_duration_since(Instant::now()) >= Duration::from_secs(300)
+                }
+                fn allowance_available(&self) -> bool {
+                    self.0.recoveries.load(SeqCst) == 0
+                }
+                fn verify_runtime_and_config(&self) -> Result<(), String> {
+                    self.0.recovery_full_verifications.fetch_add(1, SeqCst);
+                    if let Some(error) = self.0.recovery_error {
+                        return Err(error.into());
+                    }
+                    Ok(())
+                }
+                fn commit(&mut self) -> Result<bool, String> {
+                    if self
+                        .0
+                        .recoveries
+                        .compare_exchange(0, 1, SeqCst, SeqCst)
+                        .is_err()
+                    {
+                        return Ok(false);
+                    }
+                    self.0.state.lock().unwrap().spawns += 1;
+                    Ok(true)
+                }
             }
-            Ok(false)
+            poll_recovery(&mut Poll(self, deadline))
         }
         async fn child_running(&self) -> bool {
             self.state.lock().unwrap().running
@@ -1160,6 +1191,21 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn ordinary_recovery_polling_never_runs_full_runtime_verification() {
+        let mut fake = Fake::new();
+        fake.recovery = true;
+        owned(&fake, fake.deadline(900), sleep(Duration::from_secs(359)))
+            .await
+            .unwrap();
+        assert_eq!(
+            fake.recovery_full_verifications
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(fake.state.lock().unwrap().spawns, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn stalled_initial_child_recovers_once_and_repeats_full_postconditions() {
         let mut fake = Fake::new();
         fake.recovery = true;
@@ -1174,6 +1220,11 @@ mod tests {
         assert_eq!(state.plugins, 1);
         assert_eq!(state.patches.len(), 1);
         assert!(fake.began.elapsed() >= Duration::from_secs(360));
+        assert_eq!(
+            fake.recovery_full_verifications
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
     }
     #[tokio::test(start_paused = true)]
     async fn stalled_replacement_never_gets_a_third_spawn_or_new_deadline() {
@@ -1197,6 +1248,11 @@ mod tests {
             DEADLINE_ERROR
         );
         assert_eq!(fake.state.lock().unwrap().spawns, 1);
+        assert_eq!(
+            fake.recovery_full_verifications
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
     }
 
     #[tokio::test(start_paused = true)]

@@ -391,10 +391,14 @@ fn runtime_dir_is_valid(runtime_id: &str, expected_engine_version: &str) -> bool
     let Ok(dir) = runtime_paths::runtime_version_dir(runtime_id) else {
         return false;
     };
+    runtime_dir_is_valid_at(&dir, expected_engine_version)
+}
+
+fn runtime_dir_is_valid_at(dir: &Path, expected_engine_version: &str) -> bool {
     !dir.join(INSTALLING_MARKER).exists()
-        && runtime_shim_path(&dir).exists()
-        && installed_openclaw_version(&dir).as_deref() == Some(expected_engine_version)
-        && installed_node_version(&dir).is_some_and(|node| node_version_is_supported(&node))
+        && runtime_shim_path(dir).exists()
+        && installed_openclaw_version(dir).as_deref() == Some(expected_engine_version)
+        && installed_node_version(dir).is_some_and(|node| node_version_is_supported(&node))
 }
 
 /// Where `runtime/current` points right now, if anywhere valid. Prefers the
@@ -405,8 +409,41 @@ pub fn current_runtime_version() -> Option<String> {
     runtime_dir_is_valid(&runtime_id, OPENCLAW_ENGINE_VERSION).then_some(runtime_id)
 }
 
-fn current_runtime_pointer_version() -> Option<String> {
+/// Polling hint only: this does not authenticate Node or authorize a launch.
+/// Full runtime verification remains mandatory before recovery is consumed.
+#[derive(Debug, PartialEq, Eq)]
+pub struct UnverifiedRecoveryRuntimeIdentity(String);
+impl UnverifiedRecoveryRuntimeIdentity {
+    pub fn matches_runtime(&self, runtime: &str) -> bool {
+        self.0 == runtime
+    }
+}
+
+pub fn unverified_recovery_runtime_identity() -> Option<UnverifiedRecoveryRuntimeIdentity> {
     let base = runtime_paths::runtime_base_dir().ok()?;
+    unverified_recovery_runtime_identity_at(&base)
+}
+
+fn unverified_recovery_runtime_identity_at(
+    base: &Path,
+) -> Option<UnverifiedRecoveryRuntimeIdentity> {
+    let runtime_id = current_runtime_pointer_version_at(base)?;
+    let dir = base.join(format!("v{runtime_id}"));
+    if dir.join(INSTALLING_MARKER).try_exists().ok()?
+        || !runtime_shim_path(&dir).is_file()
+        || installed_openclaw_version(&dir).as_deref() != Some(OPENCLAW_ENGINE_VERSION)
+        || !runtime_node_path(&dir).is_file()
+    {
+        return None;
+    }
+    Some(UnverifiedRecoveryRuntimeIdentity(runtime_id))
+}
+
+fn current_runtime_pointer_version() -> Option<String> {
+    current_runtime_pointer_version_at(&runtime_paths::runtime_base_dir().ok()?)
+}
+
+fn current_runtime_pointer_version_at(base: &Path) -> Option<String> {
     let from_link = fs::read_link(base.join("current")).ok().and_then(|target| {
         target
             .file_name()
@@ -414,9 +451,8 @@ fn current_runtime_pointer_version() -> Option<String> {
             .and_then(|name| name.strip_prefix('v').map(str::to_string))
     });
     let version = from_link.or_else(|| {
-        runtime_paths::current_marker_path()
+        fs::read_to_string(base.join("current.version"))
             .ok()
-            .and_then(|marker| fs::read_to_string(marker).ok())
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
     })?;
@@ -870,6 +906,133 @@ pub fn activate_runtime_version(version: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recovery_await_boundaries_reject_replaced_node_and_runtime() {
+        use std::os::unix::fs::PermissionsExt;
+        for boundary in ["before_spawn", "before_activation"] {
+            for changed in ["node", "runtime"] {
+                let root =
+                    std::env::temp_dir().join(format!("uniopc-await-{}", uuid::Uuid::new_v4()));
+                let dir = root.join("vfixture");
+                let package = dir.join("tools/node/node_modules/uniopc-engine/package.json");
+                fs::create_dir_all(package.parent().unwrap()).unwrap();
+                fs::create_dir_all(runtime_node_path(&dir).parent().unwrap()).unwrap();
+                fs::create_dir_all(runtime_shim_path(&dir).parent().unwrap()).unwrap();
+                fs::write(root.join("current.version"), "fixture").unwrap();
+                fs::write(runtime_shim_path(&dir), "shim").unwrap();
+                fs::write(
+                    &package,
+                    serde_json::json!({"version": OPENCLAW_ENGINE_VERSION}).to_string(),
+                )
+                .unwrap();
+                let node = runtime_node_path(&dir);
+                fs::write(&node, "#!/bin/sh\nprintf 'v24.19.0\\n'\n").unwrap();
+                fs::set_permissions(&node, fs::Permissions::from_mode(0o700)).unwrap();
+                assert!(runtime_dir_is_valid_at(&dir, OPENCLAW_ENGINE_VERSION));
+                // Simulate replacement while termination/reaping or spawn is awaited.
+                let mutation_dir = dir.clone();
+                tokio::spawn(async move {
+                    tokio::task::yield_now().await;
+                    if changed == "node" {
+                        fs::write(
+                            runtime_node_path(&mutation_dir),
+                            "#!/bin/sh\nprintf 'v1.0.0\\n'\n",
+                        )
+                        .unwrap();
+                    } else {
+                        fs::write(
+                            mutation_dir.join("tools/node/node_modules/uniopc-engine/package.json"),
+                            r#"{"version":"changed"}"#,
+                        )
+                        .unwrap();
+                    }
+                })
+                .await
+                .unwrap();
+                // The cheap hint deliberately cannot authenticate a replaced Node.
+                assert_eq!(
+                    unverified_recovery_runtime_identity_at(&root).is_some(),
+                    changed == "node"
+                );
+                let mut spawned = boundary == "before_activation";
+                let mut activated = false;
+                if runtime_dir_is_valid_at(&dir, OPENCLAW_ENGINE_VERSION) {
+                    if boundary == "before_spawn" {
+                        spawned = true;
+                    } else {
+                        activated = true;
+                    }
+                }
+                assert_eq!(
+                    spawned,
+                    boundary == "before_activation",
+                    "{boundary}: {changed} replacement must block spawn"
+                );
+                assert!(
+                    !activated,
+                    "{boundary}: {changed} replacement must block activation"
+                );
+                fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_identity_is_filesystem_only_and_rejects_incomplete_runtime() {
+        let root = std::env::temp_dir().join(format!("uniopc-poll-{}", uuid::Uuid::new_v4()));
+        let dir = root.join("vfixture");
+        fs::create_dir_all(dir.join("tools/node/node_modules/uniopc-engine")).unwrap();
+        fs::create_dir_all(runtime_shim_path(&dir).parent().unwrap()).unwrap();
+        fs::create_dir_all(runtime_node_path(&dir).parent().unwrap()).unwrap();
+        fs::write(root.join("current.version"), "fixture").unwrap();
+        fs::write(runtime_shim_path(&dir), "shim").unwrap();
+        // Deliberately not an executable: polling cannot run this fake Node.
+        fs::write(runtime_node_path(&dir), "not executable").unwrap();
+        let package = dir.join("tools/node/node_modules/uniopc-engine/package.json");
+        fs::write(
+            &package,
+            serde_json::json!({"version": OPENCLAW_ENGINE_VERSION}).to_string(),
+        )
+        .unwrap();
+        for _ in 0..400 {
+            assert!(unverified_recovery_runtime_identity_at(&root)
+                .unwrap()
+                .matches_runtime("fixture"));
+        }
+        fs::write(dir.join(INSTALLING_MARKER), "").unwrap();
+        assert!(unverified_recovery_runtime_identity_at(&root).is_none());
+        fs::remove_file(dir.join(INSTALLING_MARKER)).unwrap();
+        fs::write(&package, "invalid json").unwrap();
+        assert!(unverified_recovery_runtime_identity_at(&root).is_none());
+        fs::write(&package, r#"{"version":"wrong"}"#).unwrap();
+        assert!(unverified_recovery_runtime_identity_at(&root).is_none());
+        fs::write(
+            &package,
+            serde_json::json!({"version": OPENCLAW_ENGINE_VERSION}).to_string(),
+        )
+        .unwrap();
+        fs::remove_file(runtime_node_path(&dir)).unwrap();
+        assert!(unverified_recovery_runtime_identity_at(&root).is_none());
+        fs::write(runtime_node_path(&dir), "not executable").unwrap();
+        fs::remove_file(runtime_shim_path(&dir)).unwrap();
+        assert!(unverified_recovery_runtime_identity_at(&root).is_none());
+        fs::write(runtime_shim_path(&dir), "shim").unwrap();
+        fs::write(root.join("current.version"), "different").unwrap();
+        assert!(unverified_recovery_runtime_identity_at(&root).is_none());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("vfixture", root.join("current")).unwrap();
+            assert!(unverified_recovery_runtime_identity_at(&root)
+                .unwrap()
+                .matches_runtime("fixture"));
+            fs::remove_file(root.join("current")).unwrap();
+        }
+        fs::remove_file(root.join("current.version")).unwrap();
+        assert!(unverified_recovery_runtime_identity_at(&root).is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn legacy_windows_cache_cleanup_keeps_unrecognized_files() {

@@ -1798,52 +1798,104 @@ impl GatewaySupervisor {
             let Some(child) = guard.as_mut() else {
                 return Ok(false);
             };
-            if child.profile.as_deref() != Some(profile)
-                || child.generation != generation
-                || crate::services::openclaw_bundled_runtime::current_runtime_version().as_deref()
-                    != Some(child.runtime_id.as_str())
-            {
-                return Err("gateway_startup_identity_changed".into());
+            struct Poll<'a> {
+                supervisor: &'a GatewaySupervisor,
+                child: &'a mut GatewayChild,
+                profile: &'a str,
+                generation: u64,
+                identity: u64,
+                runtime: String,
+                deadline: tokio::time::Instant,
+                check: &'a (dyn Fn() -> Result<(), String> + Send + Sync),
             }
-            if !matches!(child.process.try_wait(), Ok(None)) {
-                return Ok(false);
-            }
-            if !child
-                .progress
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .eligible(
-                    Instant::now(),
-                    deadline.saturating_duration_since(tokio::time::Instant::now()),
-                )
-            {
-                return Ok(false);
-            }
-            child.launch.verify_config()?;
-            {
-                // Serialize the final eligibility decision with header/listen
-                // latches until the synchronous termination request is sent.
-                let progress = child.progress.lock().unwrap_or_else(|e| e.into_inner());
-                if !progress.eligible(
-                    Instant::now(),
-                    deadline.saturating_duration_since(tokio::time::Instant::now()),
-                ) {
-                    return Ok(false);
+            impl crate::services::gateway_startup_progress::RecoveryPoll for Poll<'_> {
+                fn check_identity(&mut self) -> Result<bool, String> {
+                    (self.check)()?;
+                    crate::commands::openclaw_connection::ensure_local_gateway_generation(
+                        self.generation,
+                    )?;
+                    if self.child.identity != self.identity
+                        || self.child.generation != self.generation
+                        || self.child.profile.as_deref() != Some(self.profile)
+                        || self.child.runtime_id != self.runtime
+                        || crate::services::uniopc_runtime_paths::read_active_profile_key().as_deref() != Some(self.profile)
+                        || !crate::services::openclaw_bundled_runtime::unverified_recovery_runtime_identity()
+                            .is_some_and(|identity| identity.matches_runtime(&self.runtime))
+                    {
+                        return Err("gateway_startup_identity_changed".into());
+                    }
+                    Ok(matches!(self.child.process.try_wait(), Ok(None)))
                 }
-                check()?;
-                if !self
-                    .startup_allowance
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .consume()
-                {
-                    return Ok(false);
+                fn eligible(&self) -> bool {
+                    self.child
+                        .progress
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .eligible(
+                            Instant::now(),
+                            self.deadline
+                                .saturating_duration_since(tokio::time::Instant::now()),
+                        )
                 }
-                // Cancellation or uncertainty stays closed across later flights.
-                self.recovery_blocked
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
-                crate::services::owned_command::request_job_termination(&child.job)
-                    .map_err(|_| "gateway_startup_termination_unconfirmed")?;
+                fn allowance_available(&self) -> bool {
+                    self.supervisor
+                        .startup_allowance
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .available()
+                }
+                fn verify_runtime_and_config(&self) -> Result<(), String> {
+                    if crate::services::openclaw_bundled_runtime::current_runtime_version()
+                        .as_deref()
+                        != Some(self.runtime.as_str())
+                    {
+                        return Err("gateway_startup_identity_changed".into());
+                    }
+                    self.child.launch.verify_config()
+                }
+                fn commit(&mut self) -> Result<bool, String> {
+                    // Headers/listening cannot race the final identity check and consume.
+                    let progress = self.child.progress.clone();
+                    let progress = progress.lock().unwrap_or_else(|e| e.into_inner());
+                    if !self.check_identity()?
+                        || !progress.eligible(
+                            Instant::now(),
+                            self.deadline
+                                .saturating_duration_since(tokio::time::Instant::now()),
+                        )
+                    {
+                        return Ok(false);
+                    }
+                    let mut allowance = self
+                        .supervisor
+                        .startup_allowance
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    (self.check)()?;
+                    if !allowance.consume() {
+                        return Ok(false);
+                    }
+                    self.supervisor
+                        .recovery_blocked
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    crate::services::owned_command::request_job_termination(&self.child.job)
+                        .map_err(|_| "gateway_startup_termination_unconfirmed".to_string())?;
+                    Ok(true)
+                }
+            }
+            let identity = child.identity;
+            let runtime = child.runtime_id.clone();
+            if !crate::services::gateway_startup_progress::poll_recovery(&mut Poll {
+                supervisor: self,
+                child,
+                profile,
+                generation,
+                identity,
+                runtime,
+                deadline,
+                check: &check,
+            })? {
+                return Ok(false);
             }
             let launch = child.launch.clone();
             let runtime = child.runtime_id.clone();

@@ -111,6 +111,9 @@ impl Allowance {
             self.anchor = None;
         }
     }
+    pub fn available(&self) -> bool {
+        !self.consumed
+    }
     pub fn consume(&mut self) -> bool {
         if self.consumed {
             false
@@ -132,6 +135,27 @@ impl Allowance {
     pub fn detached(&mut self) {
         self.anchor = None;
     }
+}
+
+/// Production recovery polling seam. Cheap checks must never execute Node.
+/// The commit implementation repeats all checks under the final progress latch.
+pub trait RecoveryPoll {
+    fn check_identity(&mut self) -> Result<bool, String>;
+    fn eligible(&self) -> bool;
+    fn allowance_available(&self) -> bool;
+    fn verify_runtime_and_config(&self) -> Result<(), String>;
+    fn commit(&mut self) -> Result<bool, String>;
+}
+
+pub fn poll_recovery(poll: &mut impl RecoveryPoll) -> Result<bool, String> {
+    if !poll.check_identity()? || !poll.eligible() || !poll.allowance_available() {
+        return Ok(false);
+    }
+    poll.verify_runtime_and_config()?;
+    if !poll.check_identity()? || !poll.eligible() || !poll.allowance_available() {
+        return Ok(false);
+    }
+    poll.commit()
 }
 
 /// Exact read-only config identity. Neither bytes nor digest cross telemetry.
@@ -165,6 +189,92 @@ impl ConfigIdentity {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn recovery_poll_defers_full_verification_and_rechecks_before_commit() {
+        use std::cell::Cell;
+        struct Poll {
+            ready: Cell<bool>,
+            allowance: Cell<bool>,
+            valid: Cell<Option<bool>>,
+            verified: Cell<usize>,
+            committed: usize,
+            race: u8,
+        }
+        impl RecoveryPoll for Poll {
+            fn check_identity(&mut self) -> Result<bool, String> {
+                if self.race == 6 {
+                    return Ok(false);
+                }
+                self.valid.get().ok_or_else(|| "identity_or_cancel".into())
+            }
+            fn eligible(&self) -> bool {
+                self.ready.get()
+            }
+            fn allowance_available(&self) -> bool {
+                self.allowance.get()
+            }
+            fn verify_runtime_and_config(&self) -> Result<(), String> {
+                self.verified.set(self.verified.get() + 1);
+                match self.race {
+                    1 => self.valid.set(None),
+                    2 => self.allowance.set(false),
+                    3 => return Err("full_verification_failed".into()),
+                    4 => self.ready.set(false),
+                    5 => self.valid.set(Some(false)),
+                    _ => {}
+                }
+                Ok(())
+            }
+            fn commit(&mut self) -> Result<bool, String> {
+                self.allowance.set(false);
+                self.committed += 1;
+                Ok(true)
+            }
+        }
+        for (ready, available, valid, race, expected_verifications, expected_commits) in [
+            (false, true, true, 0, 0, 0),
+            (true, false, true, 0, 0, 0),
+            (true, true, false, 0, 0, 0),
+            (true, true, true, 1, 1, 0),
+            (true, true, true, 2, 1, 0),
+            (true, true, true, 3, 1, 0),
+            (true, true, true, 4, 1, 0),
+            (true, true, true, 5, 1, 0),
+            (true, true, true, 6, 0, 0),
+            (true, true, true, 0, 1, 1),
+        ] {
+            let mut poll = Poll {
+                ready: Cell::new(ready),
+                allowance: Cell::new(available),
+                valid: Cell::new(valid.then_some(true)),
+                verified: Cell::new(0),
+                committed: 0,
+                race,
+            };
+            let _ = poll_recovery(&mut poll);
+            assert_eq!(poll.verified.get(), expected_verifications);
+            assert_eq!(poll.committed, expected_commits);
+            if expected_verifications == 0 {
+                for _ in 0..400 {
+                    let _ = poll_recovery(&mut poll);
+                }
+                assert_eq!(
+                    poll.verified.get(),
+                    0,
+                    "ordinary polling must not execute Node"
+                );
+            }
+            if expected_commits == 1 {
+                assert!(!poll_recovery(&mut poll).unwrap());
+                assert_eq!(
+                    poll.verified.get(),
+                    1,
+                    "spent allowance must skip Node on later polls"
+                );
+            }
+        }
+    }
+
     #[test]
     fn exact_boundaries_and_progress() {
         let now = Instant::now();
