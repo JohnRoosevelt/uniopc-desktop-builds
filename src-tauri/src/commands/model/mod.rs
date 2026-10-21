@@ -12090,9 +12090,83 @@ mod gateway_startup_windows_tests {
             ),
         )
         .unwrap();
-        let marker = dir.join("escaped");
+        let markers: Vec<_> = (0..5)
+            .map(|branch| dir.join(format!("escaped-{branch}")))
+            .collect();
         let body = dir.join("body.cjs");
-        fs::write(&body, format!("require('node:child_process').spawnSync({},['--exact',{},'--nocapture'],{{stdio:'inherit'}})", serde_json::to_string(&std::env::current_exe().unwrap().to_string_lossy()).unwrap(), serde_json::to_string(FIXTURE).unwrap())).unwrap();
+        let worker = dir.join("worker.cjs");
+        let fork = dir.join("fork.cjs");
+        let topology = dir.join("topology.ready");
+        // Exercise a case alias in the real FrozenLaunch/ACK/held-job path.
+        let startup_argument = preload.to_string_lossy().to_uppercase();
+        let common = r#"
+            const assert=require('node:assert/strict');
+            assert.deepEqual(process.execArgv,['--trace-warnings']);
+            function leaf(data,send){
+              const child=require('node:child_process').spawn(data.executable,
+                ['--exact',data.fixture,'--nocapture'],{stdio:'inherit',
+                  env:{...process.env,UNIOPC_STARTUP_JOB_FIXTURE:data.marker}});
+              child.on('error',()=>process.exit(1));
+              child.on('spawn',()=>send({leafPid:child.pid}));
+              child.on('exit',code=>process.exit(code||0));
+            }
+            function forkChild(data,send){
+              const child=require('node:child_process').fork(data.fork,[JSON.stringify({...data,mode:'leaf'})],
+                {stdio:['ignore','ignore','inherit','ipc']});
+              child.on('error',()=>process.exit(1));child.on('message',send);
+              child.on('exit',code=>process.exit(code||0));
+            }
+        "#;
+        fs::write(&worker, common.to_string() + r#"
+            const {parentPort,workerData:data,Worker}=require('node:worker_threads');
+            const send=value=>parentPort.postMessage(value);
+            if(data.mode==='probe')send(process.execArgv);
+            else if(data.mode==='nested'){
+              const w=new Worker(data.worker,{workerData:{...data,mode:'fork'}});
+              w.on('message',send);w.on('error',()=>process.exit(1));w.on('exit',code=>process.exit(code||0));
+            }else if(data.mode==='fork')forkChild(data,send);
+            else leaf(data,send);
+        "#).unwrap();
+        fs::write(&fork, common.to_string() + r#"
+            const data=JSON.parse(process.argv[2]);
+            const send=value=>process.send({...value,forkPid:process.pid});
+            if(data.mode==='worker'){
+              const w=new (require('node:worker_threads').Worker)(data.worker,{workerData:{...data,mode:'leaf'}});
+              w.on('message',send);w.on('error',()=>process.exit(1));w.on('exit',code=>process.exit(code||0));
+            }else leaf(data,send);
+        "#).unwrap();
+        let context = serde_json::json!({"worker": worker, "fork": fork, "topology": topology,
+            "preload": preload, "markers": markers, "executable": std::env::current_exe().unwrap(), "fixture": FIXTURE});
+        fs::write(&body, format!("const context={context};\n") + r#"
+            const assert=require('node:assert/strict');
+            const {Worker}=require('node:worker_threads');
+            const handles=[];
+            function worker(data,explicit=false,probe=false){return new Promise((resolve,reject)=>{
+              const options={workerData:data};
+              if(explicit)options.execArgv=['--trace-warnings','--require',context.preload];
+              const w=new Worker(context.worker,options);handles.push(w);
+              let result;w.on('message',value=>{result=value;if(!probe)resolve(value)});w.on('error',reject);
+              w.on('exit',code=>code?reject(new Error('worker exit '+code)):probe&&resolve(result));
+            });}
+            function fork(data){return new Promise((resolve,reject)=>{
+              const child=require('node:child_process').fork(context.fork,[JSON.stringify(data)],
+                {stdio:['ignore','ignore','inherit','ipc']});handles.push(child);
+              child.on('message',resolve);child.on('error',reject);
+              child.on('exit',code=>reject(new Error('fork exited '+code)));
+            });}
+            (async()=>{
+              assert.deepEqual(process.execArgv,['--trace-warnings']);
+              assert.equal(process.env.NODE_OPTIONS,undefined);
+              assert.deepEqual(await worker({mode:'probe'},false,true),['--trace-warnings']);
+              assert.deepEqual(await worker({mode:'probe'},true,true),['--trace-warnings']);
+              const branches=[];
+              for(let index=0;index<5;index++){
+                const data={...context,marker:context.markers[index],mode:index===0?'worker':index<3?'fork':'nested'};
+                branches.push(await(index===0?fork(data):worker(data,index===2||index===4)));
+              }
+              require('node:fs').writeFileSync(context.topology,JSON.stringify({rootPid:process.pid,branches}));
+            })().catch(error=>{console.error(error);process.exit(1)});
+        "#).unwrap();
         let mut env: BTreeMap<_, _> = std::env::vars_os().collect();
         env.insert(
             "NODE_OPTIONS".into(),
@@ -12102,15 +12176,12 @@ mod gateway_startup_windows_tests {
             )
             .into(),
         );
-        env.insert(
-            "UNIOPC_STARTUP_JOB_FIXTURE".into(),
-            marker.clone().into_os_string(),
-        );
         let launch = FrozenGatewayLaunch {
             program: node.into_os_string(),
             args: vec![
                 "--require".into(),
-                preload.into_os_string(),
+                startup_argument.into(),
+                "--trace-warnings".into(),
                 body.into_os_string(),
             ],
             env,
@@ -12123,15 +12194,19 @@ mod gateway_startup_windows_tests {
             .spawn(Some("fixture".into()), "fixture".into(), 0, 1)
             .await
             .unwrap();
-        for _ in 0..400 {
-            if marker.with_extension("ready").exists() {
+        for _ in 0..1000 {
+            if markers
+                .iter()
+                .all(|marker| marker.with_extension("ready").exists())
+                && topology.exists()
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(
-            marker.with_extension("ready").exists(),
-            "contained grandchild did not execute"
+            markers.iter().all(|marker| marker.with_extension("ready").exists()) && topology.exists(),
+            "default/explicit Worker, fork, Worker-to-fork or nested Worker-to-fork did not execute"
         );
         assert!(
             !hostile_marker.exists(),
@@ -12146,29 +12221,46 @@ mod gateway_startup_windows_tests {
                 Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
             },
         };
-        let pid = fs::read_to_string(marker.with_extension("ready"))
-            .unwrap()
-            .parse::<u32>()
-            .unwrap();
-        let descendant = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-        assert!(!descendant.is_null());
-        let mut member = 0;
-        let queried = unsafe { IsProcessInJob(descendant, child.job.as_raw_handle(), &mut member) };
-        unsafe {
-            CloseHandle(descendant);
+        let topology: serde_json::Value =
+            serde_json::from_slice(&fs::read(&topology).unwrap()).unwrap();
+        let root_pid = topology["rootPid"].as_u64().unwrap() as u32;
+        assert_eq!(Some(root_pid), child.process.id());
+        let mut pids = vec![root_pid];
+        let branches = topology["branches"].as_array().unwrap();
+        assert_eq!(branches.len(), markers.len());
+        for (branch, marker) in branches.iter().zip(&markers) {
+            let leaf_pid = fs::read_to_string(marker.with_extension("ready"))
+                .unwrap()
+                .parse::<u32>()
+                .unwrap();
+            assert_eq!(branch["leafPid"].as_u64().unwrap() as u32, leaf_pid);
+            pids.push(leaf_pid);
+            pids.push(branch["forkPid"].as_u64().unwrap() as u32);
         }
-        assert_ne!(queried, 0);
-        assert_ne!(
-            member, 0,
-            "grandchild was created outside the exact held job"
-        );
+        for pid in pids {
+            let descendant = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+            assert!(!descendant.is_null(), "descendant {pid} disappeared");
+            let mut member = 0;
+            let queried =
+                unsafe { IsProcessInJob(descendant, child.job.as_raw_handle(), &mut member) };
+            unsafe {
+                CloseHandle(descendant);
+            }
+            assert_ne!(queried, 0);
+            assert_ne!(
+                member, 0,
+                "descendant {pid} was created outside the exact held job"
+            );
+        }
         crate::services::owned_command::terminate_job(&child.job, &mut child.process)
             .await
             .unwrap();
-        fs::write(marker.with_extension("go"), "go").unwrap();
+        for marker in &markers {
+            fs::write(marker.with_extension("go"), "go").unwrap();
+        }
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
-            !marker.exists(),
+            markers.iter().all(|marker| !marker.exists()),
             "terminated descendant wrote after zero-member proof"
         );
         fs::remove_dir_all(dir).unwrap();
@@ -12305,5 +12397,73 @@ mod gateway_startup_windows_tests {
             );
             fs::remove_dir_all(dir).unwrap();
         }
+    }
+    #[tokio::test]
+    async fn windows_gateway_startup_pair_alias_duplicates_and_ambiguity_fail_closed() {
+        let node = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|dir| dir.join("node.exe"))
+            .find(|path| path.is_file())
+            .expect("Windows candidate CI must provide Node");
+        let dir =
+            std::env::temp_dir().join(format!("uniopc-preload-alias-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let preload = dir.join("startup.cjs");
+        fs::write(
+            &preload,
+            include_str!("../../services/gateway_startup_progress.cjs"),
+        )
+        .unwrap();
+        let hardlink = dir.join("startup-hardlink.cjs");
+        fs::hard_link(&preload, &hardlink).unwrap();
+        let original = preload.to_string_lossy().to_string();
+        let marker = dir.join("body-ran");
+        for args in [
+            vec![
+                "--require".to_string(),
+                original.clone(),
+                "--require".into(),
+                original.to_uppercase(),
+            ],
+            vec![
+                "--require".to_string(),
+                original.clone(),
+                "--require".into(),
+                hardlink.to_string_lossy().to_string(),
+            ],
+            vec![format!("--require={original}")],
+        ] {
+            let mut args: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
+            args.extend([
+                "-e".into(),
+                format!(
+                    "require('node:fs').writeFileSync({},'bad')",
+                    serde_json::to_string(&marker.to_string_lossy()).unwrap()
+                )
+                .into(),
+            ]);
+            let launch = FrozenGatewayLaunch {
+                program: node.clone().into_os_string(),
+                args,
+                env: std::env::vars_os().collect(),
+                directory: None,
+                log_path: None,
+                port: 1234,
+                config_identity: None,
+            };
+            let mut child = launch
+                .spawn(Some("fixture".into()), "fixture".into(), 0, 1)
+                .await
+                .unwrap();
+            let status = tokio::time::timeout(Duration::from_secs(5), child.process.wait())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(status.code(), Some(78));
+            assert!(!marker.exists());
+            crate::services::owned_command::terminate_job(&child.job, &mut child.process)
+                .await
+                .unwrap();
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 }
