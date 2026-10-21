@@ -23,7 +23,7 @@ const LEGAL_ATTRIBUTION_LINES = [
   '"X-OpenRouter-Title":"OpenClaw"',
 ]
 // Pinned 2026.8.1 loader structure, shared by the unsigned-stage patch and
-// archive verifier. A marker or a second helper cannot satisfy this contract.
+// archive verifier. Each of the two pinned distribution roles must be present.
 export const WINDOWS_NATIVE_REQUIRE_ORIGINAL = String.raw`function tryNativeRequireJavaScriptModule(modulePath, options = {}) {
 	if (process.platform === "win32" && options.allowWindows !== true) return { ok: false };
 	if (!isJavaScriptModulePath(modulePath)) return { ok: false };
@@ -48,9 +48,12 @@ export const WINDOWS_NATIVE_REQUIRE_PATCHED = WINDOWS_NATIVE_REQUIRE_ORIGINAL.re
 \tif (!isJavaScriptModulePath(modulePath))`,
 )
 
+export const WINDOWS_WORKER_NATIVE_REQUIRE_ORIGINAL = "function tryNativeRequireJavaScriptModule(Ot,Zt={}){if(process.platform===`win32`&&Zt.allowWindows!==!0||!isJavaScriptModulePath(Ot))return{ok:!1};try{return{ok:!0,moduleExport:requireWithOptionalAliases(Ot,Zt.aliasMap)}}catch(_n){let Dn=_n&&typeof _n==`object`?_n.code:void 0;if(isSourceTransformFallbackError(_n,Ot)||Zt.fallbackOnNativeError||Zt.fallbackOnMissingDependency===!0&&(Dn===`MODULE_NOT_FOUND`||Dn===`ERR_MODULE_NOT_FOUND`))return{ok:!1};throw _n}}"
+export const WINDOWS_WORKER_NATIVE_REQUIRE_PATCHED = "function tryNativeRequireJavaScriptModule(Ot,Zt={}){if(process.platform===`win32`&&Zt.allowWindows!==!0)return{ok:!1};if(/^file:/i.test(Ot)){let nativeUrl=new URL(Ot);if(Ot.includes(\"?\")||Ot.includes(\"#\")||/%2f|%5c/i.test(nativeUrl.pathname))throw new TypeError(\"Native module file URL must preserve its exact identity\");Ot=fileURLToPath(nativeUrl)}if(!isJavaScriptModulePath(Ot))return{ok:!1};try{return{ok:!0,moduleExport:requireWithOptionalAliases(Ot,Zt.aliasMap)}}catch(_n){let Dn=_n&&typeof _n==`object`?_n.code:void 0;if(isSourceTransformFallbackError(_n,Ot)||Zt.fallbackOnNativeError||Zt.fallbackOnMissingDependency===!0&&(Dn===`MODULE_NOT_FOUND`||Dn===`ERR_MODULE_NOT_FOUND`))return{ok:!1};throw _n}}"
+
 // These byte contracts cover the complete installed 2026.8.1 prefix (byte 0
 // through the native region boundary) and the entire native region, including
-// alias hooks and error classification. They also prove the helper is top-level
+// alias hooks and error classification. They prove the readable helper is top-level
 // without importing a parser before npm ci. Any upstream drift needs review.
 const NATIVE_REGION = '//#region src/plugins/native-module-require.ts'
 const NATIVE_PREFIX_SHA256 = '50d9c9cfbd6565ebf4bc5551a8029761357f1d91731bf54745eab6119778699d'
@@ -61,6 +64,31 @@ const nativeDigest = value => createHash('sha256').update(value, 'utf8').digest(
 // region; a second declaration must never evade uniqueness through trivia.
 const nativeTrivia = String.raw`(?:\s|/\*[\s\S]*?\*/|//[^\r\n]*)*`
 const nativeDeclaration = String.raw`\bfunction${nativeTrivia}\*?${nativeTrivia}tryNativeRequireJavaScriptModule${nativeTrivia}\(`
+
+// Only this flagged, isolated subprocess imports SourceTextModule. It parses
+// three variants, never links/evaluates, and never prints the engine source.
+function verifyWorkerTopLevel(source, start, end) {
+  const parser = `import { SourceTextModule } from 'node:vm';
+import { readFileSync } from 'node:fs';
+try {
+  const source=readFileSync(0,'utf8');
+  const [start,end]=process.argv.slice(1).map(Number);
+  const sentinel='\\nconst tryNativeRequireJavaScriptModule=0;';
+  new SourceTextModule(source);
+  let duplicate=false;
+  try { new SourceTextModule(source+sentinel); }
+  catch(error) { duplicate=error instanceof SyntaxError && error.message.includes("Identifier 'tryNativeRequireJavaScriptModule' has already been declared"); }
+  if(!duplicate) throw new Error();
+  new SourceTextModule(source.slice(0,start)+source.slice(end)+sentinel);
+} catch { process.stderr.write('Worker top-level contract failed\\n');process.exitCode=1; }
+`
+  const env={...process.env}
+  for(const key of Object.keys(env)) if(['NODE_OPTIONS','NODE_PATH'].includes(key.toUpperCase())) delete env[key]
+  try {
+    execFileSync(process.execPath,['--experimental-vm-modules','--no-warnings','--input-type=module','-e',parser,String(start),String(end)],
+      {input:source,encoding:'utf8',env,stdio:['pipe','pipe','pipe'],timeout:60000,maxBuffer:65536})
+  } catch { assert.fail('Windows worker top-level uniqueness structure drift') }
+}
 
 export function inspectWindowsNativeRequireSources(sources, { allowUnpatched = false } = {}) {
   const declarations = []
@@ -73,9 +101,14 @@ export function inspectWindowsNativeRequireSources(sources, { allowUnpatched = f
       regions.push({ path: entry.path, start: match.index })
     }
   }
-  assert.equal(declarations.length, 1, 'Windows native loader requires exactly one helper')
-  assert.equal(regions.length, 1, 'Windows native loader region drift')
-  const helper = declarations[0]
+  const workerPath = entry => /(?:^|\/)dist\/worker\/worker\.mjs$/.test(entry.path.replaceAll('\\','/'))
+  const workers=declarations.filter(workerPath)
+  const readable=declarations.filter(entry=>!workerPath(entry))
+  assert.equal(readable.length,1,'Windows native loader requires exactly one readable helper')
+  assert.equal(workers.length,1,'Windows native loader requires exactly one worker helper')
+  assert.equal(declarations.length,2,'Windows native loader requires exactly two role helpers')
+  assert.equal(regions.length,1,'Windows native loader region drift')
+  const helper=readable[0]
   const regionStart = helper.source.indexOf(NATIVE_REGION)
   assert.ok(regions[0].path === helper.path && regionStart >= 0 && regionStart < helper.start,
     'Windows native loader region drift')
@@ -93,7 +126,22 @@ export function inspectWindowsNativeRequireSources(sources, { allowUnpatched = f
   const body = digest === NATIVE_REGION_PATCHED_SHA256 ? WINDOWS_NATIVE_REQUIRE_PATCHED : WINDOWS_NATIVE_REQUIRE_ORIGINAL
   assert.equal(helper.source.slice(helper.start, helper.start + body.length), body,
     'Windows native loader helper structure drift')
-  return { ...helper, end: helper.start + body.length, body }
+  const main={...helper,end:helper.start+body.length,body,patchedBody:WINDOWS_NATIVE_REQUIRE_PATCHED,role:'readable'}
+  const worker=workers[0]
+  const prefixEnd=worker.source.indexOf('from"node:url";')+'from"node:url";'.length
+  assert.equal(nativeDigest(worker.source.slice(0,prefixEnd)),
+    'a9e6d197b73b008b8d39943487a9538d766d42f6f3a86d1dfaef5e8e84accfa8','Windows worker prefix/import structure drift')
+  const blockStart=worker.source.indexOf('function toSafeImportPath(')
+  const blockEnd=worker.source.indexOf('function readPackageName$2(',blockStart)
+  assert.ok(blockStart>=prefixEnd && blockStart<worker.start && blockEnd>worker.start,'Windows worker block structure drift')
+  const blockDigest=nativeDigest(worker.source.slice(blockStart,blockEnd))
+  const patched=blockDigest==="b01eb831c1af8ba0b41f62bc61b34cac9d4b5c85cff3c579f8711e571b955471"
+  assert.ok(patched || (allowUnpatched && blockDigest==='f633f61a12aea474465ba784f813ae53e6939b2ff4f12f0f769ce73cdbbc48f8'),
+    'Windows worker compatibility patch missing or block structure drifted')
+  const workerBody=patched?WINDOWS_WORKER_NATIVE_REQUIRE_PATCHED:WINDOWS_WORKER_NATIVE_REQUIRE_ORIGINAL
+  assert.equal(worker.source.slice(worker.start,worker.start+workerBody.length),workerBody,'Windows worker helper structure drift')
+  verifyWorkerTopLevel(worker.source,worker.start,worker.start+workerBody.length)
+  return [main,{...worker,end:worker.start+workerBody.length,body:workerBody,patchedBody:WINDOWS_WORKER_NATIVE_REQUIRE_PATCHED,role:'worker'}]
 }
 
 export function assertRuntimeEntryNamesBranded(names) {

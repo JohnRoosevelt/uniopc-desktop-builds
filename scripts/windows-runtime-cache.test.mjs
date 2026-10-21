@@ -156,4 +156,7 @@ test('actual cache key, seed-key and verifier CLIs load in an isolated repo befo
   assert.match(run('verify-uniopc-whitelabel-runtime.mjs',[runtime]),/branding verified \(1 artifact\(s\)\)/)
   assert.ok(!(await readdir(root)).includes('node_modules'))
   assert.equal((await runtimeProjection({projectRoot:root})).modules.length,5)
+  const verifierImports=moduleImports(await readFile(join(root,'scripts/verify-uniopc-whitelabel-runtime.mjs'),'utf8'))
+  assert.ok(verifierImports.every(dependency=>dependency.startsWith('node:')))
+  assert.ok(!verifierImports.includes('node:vm'),'VM named import is confined to the flagged child script')
 })

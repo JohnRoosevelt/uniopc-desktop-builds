@@ -53,7 +53,7 @@ import { dirname, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { rebrandManagedRuntimeScopes } from './uniopc-runtime-scopes.mjs'
 import { rebrandEngineWrapperContract, rebrandPluginManifestPaths, rebrandCompiledRuntimePaths, rebrandRuntimeTree, retainRuntimeWorkspaceTemplates } from './uniopc-runtime-branding.mjs'
-import { inspectWindowsNativeRequireSources, WINDOWS_NATIVE_REQUIRE_PATCHED, verifyRuntimeDirectory } from './verify-uniopc-whitelabel-runtime.mjs'
+import { inspectWindowsNativeRequireSources, verifyRuntimeDirectory } from './verify-uniopc-whitelabel-runtime.mjs'
 
 import { OPENCLAW_RELEASE_NODE_VERSION } from './verify-openclaw-release-contract.mjs'
 
@@ -489,9 +489,26 @@ export async function patchWindowsNativeModuleRequire(prefix) {
     }
   }
   await collect(join(dirname(packageJsonPath), 'dist'))
-  const helper = inspectWindowsNativeRequireSources(sources, { allowUnpatched: true })
-  const next = helper.source.slice(0, helper.start) + WINDOWS_NATIVE_REQUIRE_PATCHED + helper.source.slice(helper.end)
-  if (next !== helper.source) await writeFile(helper.path, next, 'utf8')
+  const helpers = inspectWindowsNativeRequireSources(sources, { allowUnpatched: true })
+  const changes = helpers.map(helper => ({...helper,
+    next: helper.source.slice(0,helper.start)+helper.patchedBody+helper.source.slice(helper.end),
+    temporary: helper.path+`.native-require-${process.pid}-${Date.now()}.tmp`,
+  })).filter(change=>change.next!==change.source)
+  // Every role, including the worker's VM checks, has passed before any write.
+  // Prepare both replacements first, then publish each through an atomic rename.
+  const published=[]
+  try {
+    for(const change of changes) await writeFile(change.temporary,change.next,'utf8')
+    for(const change of changes) { await rename(change.temporary,change.path);published.push(change) }
+  } catch(error) {
+    for(const change of published) {
+      await writeFile(change.temporary,change.source,'utf8')
+      await rename(change.temporary,change.path)
+    }
+    throw error
+  } finally {
+    for(const change of changes) await rm(change.temporary,{force:true})
+  }
 }
 
 async function normalizeWindowsLayout(prefix) {

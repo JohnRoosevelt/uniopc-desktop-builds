@@ -7,7 +7,7 @@ import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 import Module, { createRequire, stripTypeScriptTypes } from 'node:module'
 import { pathToFileURL } from 'node:url'
-import { WINDOWS_NATIVE_REQUIRE_ORIGINAL, WINDOWS_NATIVE_REQUIRE_PATCHED } from './verify-uniopc-whitelabel-runtime.mjs'
+import { WINDOWS_NATIVE_REQUIRE_ORIGINAL, WINDOWS_NATIVE_REQUIRE_PATCHED, WINDOWS_WORKER_NATIVE_REQUIRE_ORIGINAL, WINDOWS_WORKER_NATIVE_REQUIRE_PATCHED } from './verify-uniopc-whitelabel-runtime.mjs'
 
 import {
   isMachOMagic,
@@ -454,6 +454,17 @@ const cachedLoaderFixture = [
   "\t});",
   "}"
 ].join('\n')
+const workerPrefixFixture = [
+  "import Module,{createRequire,flushCompileCache}from\"node:module\";import*as crypto$11 from\"node:crypto\";import crypto$1,{X509Certificate,createCipheriv,createDecipheriv,createHash,createHmac,createPrivateKey,hash,randomBytes,randomInt,randomUUID,sign,timingSafeEqual}from\"node:crypto\";import*as fssync from\"node:fs\";import fs,{accessSync,appendFileSync,chmodSync,close,closeSync,constants,createReadStream,createWriteStream,existsSync,globSync,linkSync,lstatSync,mkdirSync,openSync,promises,readFileSync,readSync,readdirSync,readlinkSync,realpathSync,renameSync,rmSync,rmdirSync,stat,statSync,unlinkSync,unwatchFile,watch,watchFile,write,writeFileSync,writev,default as openClawRootFsSync}from\"node:fs\";import*as fs$16 from\"node:fs/promises\";import fs$1,{access,chmod,copyFile,lstat,mkdir,mkdtemp,open,readFile,readdir,realpath,rm,stat as stat$1,writeFile,default as openClawRootFs}from\"node:fs/promises\";import*as path$14 from\"node:path\";import path,{basename,dirname,isAbsolute,join,posix,relative,resolve,sep,win32}from\"node:path\";import{URL as URL$1,domainToASCII,fileURLToPath,format,pathToFileURL}from\"node:url\";"
+].join('\n')
+const workerBlockFixture = [
+  "function toSafeImportPath(Ot){return process.platform!==`win32`||Ot.startsWith(`file://`)?Ot:path.win32.isAbsolute(Ot)?pathToFileURL(Ot,{windows:!0}).href:Ot}var init_import_specifier=__esmMin((()=>{}));function isJavaScriptModulePath(Ot){return[`.js`,`.mjs`,`.cjs`].includes(path.extname(Ot).toLowerCase())}function isMissingTargetModuleError(Ot,Zt){if(Ot.code!==`MODULE_NOT_FOUND`||typeof Ot.message!=`string`)return!1;let _n=Ot.message.split(`",
+  "`,1)[0]??``;return _n.includes(`'${Zt}'`)||_n.includes(`\"${Zt}\"`)}function isSourceTransformFallbackError(Ot,Zt){if(!Ot||typeof Ot!=`object`)return!1;let _n=Ot,Dn=_n.code;return Dn===`ERR_REQUIRE_ESM`||Dn===`ERR_REQUIRE_ASYNC_MODULE`||Dn===`ERR_REQUIRE_ESM_RACE_CONDITION`||isMissingTargetModuleError(_n,Zt)}function tryNativeRequireJavaScriptModule(Ot,Zt={}){if(process.platform===`win32`&&Zt.allowWindows!==!0||!isJavaScriptModulePath(Ot))return{ok:!1};try{return{ok:!0,moduleExport:requireWithOptionalAliases(Ot,Zt.aliasMap)}}catch(_n){let Dn=_n&&typeof _n==`object`?_n.code:void 0;if(isSourceTransformFallbackError(_n,Ot)||Zt.fallbackOnNativeError||Zt.fallbackOnMissingDependency===!0&&(Dn===`MODULE_NOT_FOUND`||Dn===`ERR_MODULE_NOT_FOUND`))return{ok:!1};throw _n}}function clearPluginModuleRequireCache(Ot,Zt={}){try{let _n=nodeRequire$2.resolve(Ot);clearRequireCacheSubtree(_n,resolveRequireCachePath(Zt.dependencyRoot??path.dirname(_n)),new Set)}catch{}}function resolveRequireCachePath(Ot){try{return fs.realpathSync.native(Ot)}catch{return path.resolve(Ot)}}function clearRequireCacheSubtree(Ot,Zt,_n){if(_n.has(Ot))return;_n.add(Ot);let Dn=nodeRequire$2.cache[Ot];if(Dn)for(let Ot of Dn.children)isPathInside(Zt,Ot.id)&&clearRequireCacheSubtree(Ot.id,Zt,_n);delete nodeRequire$2.cache[Ot]}function requireWithOptionalAliases(Ot,Zt){return withNativeRequireAliases(Zt,()=>createRequire(import.meta.url)(Ot))}function withNativeRequireAliases(Ot,Zt){if(!Ot||!moduleWithResolver$1._resolveFilename)return Zt();let _n=typeof Ot==`function`?Ot:Zt=>Ot[Zt],Dn=moduleWithResolver$1._resolveFilename,kn=moduleWithResolver$1.registerHooks?.({resolve(Ot,Zt,Dn){let kn=_n(Ot);return kn?{shortCircuit:!0,url:pathToFileURL(kn).href}:Dn(Ot,Zt)}});moduleWithResolver$1._resolveFilename=((Ot,Zt,kn,Pn)=>_n(Ot)||Dn(Ot,Zt,kn,Pn));try{return Zt()}finally{moduleWithResolver$1._resolveFilename=Dn,kn?.deregister()}}var nodeRequire$2,moduleWithResolver$1,init_native_module_require=__esmMin((()=>{init_path_guards(),nodeRequire$2=createRequire(import.meta.url),moduleWithResolver$1=Module}));"
+].join('\n')
+const workerSource = (patched=true) => workerPrefixFixture+'\n'+(patched
+  ?workerBlockFixture.replace(WINDOWS_WORKER_NATIVE_REQUIRE_ORIGINAL,WINDOWS_WORKER_NATIVE_REQUIRE_PATCHED)
+  :workerBlockFixture)+'function readPackageName$2(){}'
+const workerCachedLoaderFixture = "function createLazySourceTransformLoader(Ot){let loadWithSourceTransform;return()=>{if(loadWithSourceTransform)return loadWithSourceTransform;let Zt=buildPluginLoaderJitiOptions(Ot.getAliasMap(),{modulePath:Ot.loaderFilename}),_n=(Ot.createLoader??loadCreateJitiLoaderFactory$1())(Ot.loaderFilename,{...Zt,nativeModules:Ot.transformOpenClawDependencies?Zt.nativeModules.filter(Ot=>Ot!==`openclaw`):Zt.nativeModules,tryNative:!1});return loadWithSourceTransform=Ot=>_n(toSourceTransformImportPath(Ot)),loadWithSourceTransform}}function createPluginModuleLoader$1(Ot){let Zt=createLazySourceTransformLoader({...Ot}),loadCachedTarget=(Zt,_n)=>{let Dn=getPluginCacheSource(Zt,Ot.cache),kn=Dn.variants.get(Ot.cacheKey)?.exports;if(kn)return kn.value;Dn.boundaryRoot=Ot.rootDir??Dn.boundaryRoot??path.dirname(Zt.startsWith(`file:`)?fileURLToPath(Zt):Zt);let Pn=withPluginCache(Ot.cache,_n);return Dn.variants.set(Ot.cacheKey,{exports:{value:Pn}}),Pn};return Ot.tryNative?_n=>loadCachedTarget(_n,()=>{pluginModuleLoaderStats.calls+=1;let Dn=tryNativeRequireJavaScriptModule(_n,{allowWindows:!0,aliasMap:Ot.resolveAlias,fallbackOnMissingDependency:!0});return Dn.ok?(pluginModuleLoaderStats.nativeHits+=1,Dn.moduleExport):(pluginModuleLoaderStats.nativeMisses+=1,pluginModuleLoaderStats.sourceTransformFallbacks+=1,recordSourceTransformTarget(_n),Zt()(_n))}):Ot=>loadCachedTarget(Ot,()=>(pluginModuleLoaderStats.calls+=1,pluginModuleLoaderStats.sourceTransformForced+=1,recordSourceTransformTarget(Ot),Zt()(Ot)))}"
 async function nativeLoaderStage(t) {
   const prefix = realpathSync.native(mkdtempSync(join(tmpdir(), 'uniopc-native-loader-')))
   t.after(() => rmSync(prefix, { recursive: true, force: true }))
@@ -475,6 +486,8 @@ const buildPluginLoaderJitiOptions=alias=>({alias,nativeModules:['openclaw']});
 const loadCreateJitiLoaderFactory=()=>{throw new Error('fixture requires explicit fallback factory')};
 `
   writeFileSync(file, nativePrefixFixture + nativeLoaderFixture + '\n')
+  const workerFile=join(dist,'worker/worker.mjs');mkdirSync(dirname(workerFile),{recursive:true})
+  writeFileSync(workerFile,workerSource(false))
   await patchWindowsNativeModuleRequire(prefix)
   const patchedStage = readFileSync(file, 'utf8')
   const regionStart = patchedStage.indexOf('//#region src/plugins/native-module-require.ts')
@@ -486,24 +499,43 @@ const loadCreateJitiLoaderFactory=()=>{throw new Error('fixture requires explici
   writeFileSync(harness, prelude + executionRegion + cacheDependencies + cachedLoaderFixture
     + '\nexport {tryNativeRequireJavaScriptModule,clearPluginModuleRequireCache,withNativeRequireAliases,createPluginModuleLoader};')
   const loader = await import(pathToFileURL(harness).href)
-  return { prefix, dist, file, loader }
+  const workerStage=readFileSync(workerFile,'utf8')
+  const workerRegion=workerStage.slice(workerStage.indexOf('function toSafeImportPath('),workerStage.indexOf('function readPackageName$2('))
+  assert.equal(workerRegion,workerBlockFixture.replace(WINDOWS_WORKER_NATIVE_REQUIRE_ORIGINAL,WINDOWS_WORKER_NATIVE_REQUIRE_PATCHED))
+  const workerHarness=join(prefix,'worker-execution-harness.mjs')
+  writeFileSync(workerHarness,prelude+'const __esmMin=run=>run;const init_path_guards=()=>{};\n'+workerRegion+cacheDependencies+workerCachedLoaderFixture
+    +'init_native_module_require();\nexport {tryNativeRequireJavaScriptModule,withNativeRequireAliases,createPluginModuleLoader$1 as createPluginModuleLoader,pluginModuleLoaderStats};')
+  const workerLoader=await import(pathToFileURL(workerHarness).href)
+  return { prefix, dist, file, loader, workerFile, workerLoader }
 }
 
 test('native loader patch is unique, idempotent and rejects missing or drifting staged helpers before writing', async t => {
   assert.ok(nativeLoaderFixture.includes(WINDOWS_NATIVE_REQUIRE_ORIGINAL), 'recorded upstream fixture must match the pinned shape')
-  const {prefix,dist,file}=await nativeLoaderStage(t)
+  const {prefix,dist,file,workerFile}=await nativeLoaderStage(t)
+  const workerPatched=readFileSync(workerFile,'utf8')
   const patched=readFileSync(file,'utf8')
   assert.ok(patched.includes(WINDOWS_NATIVE_REQUIRE_PATCHED))
   await patchWindowsNativeModuleRequire(prefix)
   assert.equal(readFileSync(file,'utf8'),patched)
+  assert.equal(readFileSync(workerFile,'utf8'),workerPatched)
+  // Role B drift must prevent even role A's original bytes being changed.
+  writeFileSync(file,patched.replace(WINDOWS_NATIVE_REQUIRE_PATCHED,WINDOWS_NATIVE_REQUIRE_ORIGINAL))
+  const originalMain=readFileSync(file,'utf8')
+  for(const invalidWorker of [workerPatched.replace('Zt.aliasMap','Zt.changedAlias'),
+    workerPrefixFixture+'\nfunction nested(){'+workerPatched.slice(workerPrefixFixture.length)+'}']) {
+    writeFileSync(workerFile,invalidWorker)
+    await assert.rejects(patchWindowsNativeModuleRequire(prefix),/worker.*drift/)
+    assert.equal(readFileSync(file,'utf8'),originalMain)
+  }
+  writeFileSync(file,patched);writeFileSync(workerFile,workerPatched)
   const duplicate=join(dist,'second.mjs');writeFileSync(duplicate,patched)
-  await assert.rejects(patchWindowsNativeModuleRequire(prefix),/exactly one helper/)
+  await assert.rejects(patchWindowsNativeModuleRequire(prefix),/exactly one(?: readable| worker)? helper/)
   assert.equal(readFileSync(file,'utf8'),patched)
   rmSync(duplicate)
   writeFileSync(file,patched.replace('options.allowWindows !== true','options.allowWindows !== false'))
   await assert.rejects(patchWindowsNativeModuleRequire(prefix),/structure drifted/)
   writeFileSync(file,'export const noHelper=true;')
-  await assert.rejects(patchWindowsNativeModuleRequire(prefix),/exactly one helper/)
+  await assert.rejects(patchWindowsNativeModuleRequire(prefix),/exactly one(?: readable| worker)? helper/)
 })
 
 test('native loader loads real path/file URLs once, preserves special names and transitive CJS/ESM identity', async t => {
@@ -596,5 +628,36 @@ test('native loader alias hooks restore on success/error and mixed fallback shar
   assert.notEqual(reloaded.sdk,second.sdk)
   assert.deepEqual(globalThis[key],{evaluations:2,registrations:2})
   assert.equal(Module._resolveFilename,original)
+  delete globalThis[key]
+})
+
+test('worker native loader records native hits without fallback and preserves real module, URL, alias and error behavior', async t => {
+  const {dist,workerLoader:loader}=await nativeLoaderStage(t)
+  const sdk=join(dist,'worker-sdk.cjs'),file=join(dist,'worker 中文 # %.cjs')
+  const key='worker-'+dist;globalThis[key]={evaluations:0,registrations:0}
+  writeFileSync(sdk,`globalThis[${JSON.stringify(key)}].evaluations++;module.exports={registered:false,register(){if(!this.registered){this.registered=true;globalThis[${JSON.stringify(key)}].registrations++}}}`)
+  writeFileSync(file,"const sdk=require('worker-fixture-sdk');sdk.register();module.exports={sdk};")
+  const aliases={'worker-fixture-sdk':sdk};let fallbacks=0
+  const load=loader.createPluginModuleLoader({cache:{sources:new Map()},cacheKey:'worker-generation',rootDir:dist,
+    loaderFilename:file,tryNative:true,getAliasMap:()=>aliases,resolveAlias:specifier=>aliases[specifier],
+    createLoader:()=>{fallbacks++;throw new Error('unexpected worker fallback')}})
+  const first=load(file);assert.equal(load(pathToFileURL(file).href),first)
+  assert.deepEqual(globalThis[key],{evaluations:1,registrations:1});assert.equal(loader.pluginModuleLoaderStats.nativeHits,1);assert.equal(fallbacks,0)
+  const esm=join(dist,'worker-esm.mjs');writeFileSync(esm,"import sdk from 'worker-fixture-sdk';export {sdk};")
+  assert.equal(load(pathToFileURL(esm).href).sdk,first.sdk)
+  assert.equal(loader.pluginModuleLoaderStats.nativeHits,2);assert.equal(loader.pluginModuleLoaderStats.sourceTransformFallbacks,0)
+  const original=Module._resolveFilename
+  const bad=join(dist,'worker-bad.cjs');writeFileSync(bad,"require('worker-fixture-sdk');throw new Error('worker-real-error')")
+  assert.throws(()=>load(pathToFileURL(bad).href),/worker-real-error/);assert.equal(Module._resolveFilename,original)
+  assert.throws(()=>createRequire(import.meta.url)('worker-fixture-sdk'),/Cannot find module/)
+  for(const target of [pathToFileURL(file).href+'?',pathToFileURL(file).href+'#fragment',pathToFileURL(file).href.replace('worker%20','%2fworker%20'),pathToFileURL(file).href.replace('worker%20','%ZZworker%20')])
+    assert.throws(()=>loader.tryNativeRequireJavaScriptModule(target,{allowWindows:true,fallbackOnNativeError:true}),/identity|URI|URL|encoded/i)
+  assert.deepEqual(loader.tryNativeRequireJavaScriptModule(pathToFileURL(join(dist,'absent.cjs')).href,{allowWindows:true}),{ok:false})
+  const missing=join(dist,'worker-missing.cjs');writeFileSync(missing,"require('missing-worker-dependency')")
+  assert.throws(()=>loader.tryNativeRequireJavaScriptModule(missing,{allowWindows:true}),error=>error.code==='MODULE_NOT_FOUND')
+  assert.deepEqual(loader.tryNativeRequireJavaScriptModule(missing,{allowWindows:true,fallbackOnMissingDependency:true}),{ok:false})
+  const tla=join(dist,'worker-tla.mjs');writeFileSync(tla,'await Promise.resolve();export const value=23')
+  assert.deepEqual(loader.tryNativeRequireJavaScriptModule(pathToFileURL(tla).href,{allowWindows:true}),{ok:false})
+  assert.equal((await import(pathToFileURL(tla).href)).value,23)
   delete globalThis[key]
 })

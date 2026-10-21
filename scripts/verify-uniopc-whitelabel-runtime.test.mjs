@@ -64,13 +64,15 @@ test('runtime text scan rejects display branding and permits only declared attri
 })
 
 import { execFileSync } from 'node:child_process'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   inspectWindowsNativeRequireSources,
   WINDOWS_NATIVE_REQUIRE_ORIGINAL,
   WINDOWS_NATIVE_REQUIRE_PATCHED,
+  WINDOWS_WORKER_NATIVE_REQUIRE_ORIGINAL,
+  WINDOWS_WORKER_NATIVE_REQUIRE_PATCHED,
   verifyRuntimeDirectory,
 } from './verify-uniopc-whitelabel-runtime.mjs'
 import { buildOpenclawRuntimeBundle } from './build-openclaw-runtime-bundle.mjs'
@@ -197,11 +199,21 @@ const nativeRegionFixture = [
   "//#endregion"
 ].join('\n')
 const nativeSource = body => nativePrefixFixture + nativeRegionFixture.replace(WINDOWS_NATIVE_REQUIRE_ORIGINAL, body) + '\n'
+const workerPrefixFixture = [
+  "import Module,{createRequire,flushCompileCache}from\"node:module\";import*as crypto$11 from\"node:crypto\";import crypto$1,{X509Certificate,createCipheriv,createDecipheriv,createHash,createHmac,createPrivateKey,hash,randomBytes,randomInt,randomUUID,sign,timingSafeEqual}from\"node:crypto\";import*as fssync from\"node:fs\";import fs,{accessSync,appendFileSync,chmodSync,close,closeSync,constants,createReadStream,createWriteStream,existsSync,globSync,linkSync,lstatSync,mkdirSync,openSync,promises,readFileSync,readSync,readdirSync,readlinkSync,realpathSync,renameSync,rmSync,rmdirSync,stat,statSync,unlinkSync,unwatchFile,watch,watchFile,write,writeFileSync,writev,default as openClawRootFsSync}from\"node:fs\";import*as fs$16 from\"node:fs/promises\";import fs$1,{access,chmod,copyFile,lstat,mkdir,mkdtemp,open,readFile,readdir,realpath,rm,stat as stat$1,writeFile,default as openClawRootFs}from\"node:fs/promises\";import*as path$14 from\"node:path\";import path,{basename,dirname,isAbsolute,join,posix,relative,resolve,sep,win32}from\"node:path\";import{URL as URL$1,domainToASCII,fileURLToPath,format,pathToFileURL}from\"node:url\";"
+].join('\n')
+const workerBlockFixture = [
+  "function toSafeImportPath(Ot){return process.platform!==`win32`||Ot.startsWith(`file://`)?Ot:path.win32.isAbsolute(Ot)?pathToFileURL(Ot,{windows:!0}).href:Ot}var init_import_specifier=__esmMin((()=>{}));function isJavaScriptModulePath(Ot){return[`.js`,`.mjs`,`.cjs`].includes(path.extname(Ot).toLowerCase())}function isMissingTargetModuleError(Ot,Zt){if(Ot.code!==`MODULE_NOT_FOUND`||typeof Ot.message!=`string`)return!1;let _n=Ot.message.split(`",
+  "`,1)[0]??``;return _n.includes(`'${Zt}'`)||_n.includes(`\"${Zt}\"`)}function isSourceTransformFallbackError(Ot,Zt){if(!Ot||typeof Ot!=`object`)return!1;let _n=Ot,Dn=_n.code;return Dn===`ERR_REQUIRE_ESM`||Dn===`ERR_REQUIRE_ASYNC_MODULE`||Dn===`ERR_REQUIRE_ESM_RACE_CONDITION`||isMissingTargetModuleError(_n,Zt)}function tryNativeRequireJavaScriptModule(Ot,Zt={}){if(process.platform===`win32`&&Zt.allowWindows!==!0||!isJavaScriptModulePath(Ot))return{ok:!1};try{return{ok:!0,moduleExport:requireWithOptionalAliases(Ot,Zt.aliasMap)}}catch(_n){let Dn=_n&&typeof _n==`object`?_n.code:void 0;if(isSourceTransformFallbackError(_n,Ot)||Zt.fallbackOnNativeError||Zt.fallbackOnMissingDependency===!0&&(Dn===`MODULE_NOT_FOUND`||Dn===`ERR_MODULE_NOT_FOUND`))return{ok:!1};throw _n}}function clearPluginModuleRequireCache(Ot,Zt={}){try{let _n=nodeRequire$2.resolve(Ot);clearRequireCacheSubtree(_n,resolveRequireCachePath(Zt.dependencyRoot??path.dirname(_n)),new Set)}catch{}}function resolveRequireCachePath(Ot){try{return fs.realpathSync.native(Ot)}catch{return path.resolve(Ot)}}function clearRequireCacheSubtree(Ot,Zt,_n){if(_n.has(Ot))return;_n.add(Ot);let Dn=nodeRequire$2.cache[Ot];if(Dn)for(let Ot of Dn.children)isPathInside(Zt,Ot.id)&&clearRequireCacheSubtree(Ot.id,Zt,_n);delete nodeRequire$2.cache[Ot]}function requireWithOptionalAliases(Ot,Zt){return withNativeRequireAliases(Zt,()=>createRequire(import.meta.url)(Ot))}function withNativeRequireAliases(Ot,Zt){if(!Ot||!moduleWithResolver$1._resolveFilename)return Zt();let _n=typeof Ot==`function`?Ot:Zt=>Ot[Zt],Dn=moduleWithResolver$1._resolveFilename,kn=moduleWithResolver$1.registerHooks?.({resolve(Ot,Zt,Dn){let kn=_n(Ot);return kn?{shortCircuit:!0,url:pathToFileURL(kn).href}:Dn(Ot,Zt)}});moduleWithResolver$1._resolveFilename=((Ot,Zt,kn,Pn)=>_n(Ot)||Dn(Ot,Zt,kn,Pn));try{return Zt()}finally{moduleWithResolver$1._resolveFilename=Dn,kn?.deregister()}}var nodeRequire$2,moduleWithResolver$1,init_native_module_require=__esmMin((()=>{init_path_guards(),nodeRequire$2=createRequire(import.meta.url),moduleWithResolver$1=Module}));"
+].join('\n')
+const workerSource = (patched=true) => workerPrefixFixture+'\n'+(patched
+  ?workerBlockFixture.replace(WINDOWS_WORKER_NATIVE_REQUIRE_ORIGINAL,WINDOWS_WORKER_NATIVE_REQUIRE_PATCHED)
+  :workerBlockFixture)+'function readPackageName$2(){}'
 const sourceEntry = source => ({path:'dist/arbitrary-hash.js',source})
 
 test('Windows native verifier checks the actual unique helper, URL import and exact region/require/error structure', () => {
   const patched=nativeSource(WINDOWS_NATIVE_REQUIRE_PATCHED)
-  inspectWindowsNativeRequireSources([sourceEntry(patched)])
+  inspectWindowsNativeRequireSources([sourceEntry(patched),{path:'dist/worker/worker.mjs',source:workerSource()}])
   for(const sources of [
     [],[sourceEntry(nativeSource(WINDOWS_NATIVE_REQUIRE_ORIGINAL))],
     [sourceEntry(patched),{path:'dist/duplicate.js',source:patched}],
@@ -222,7 +234,7 @@ test('Windows native verifier checks the actual unique helper, URL import and ex
 
     [sourceEntry(patched.replace('requireWithOptionalAliases(modulePath, options.aliasMap)','requireWithOptionalAliases("wrong", options.aliasMap)'))],
     [sourceEntry(patched.replace('isSourceTransformFallbackError(error, modulePath)','isSourceTransformFallbackError(error, "wrong")'))],
-  ]) assert.throws(()=>inspectWindowsNativeRequireSources(sources),/exactly one|patch missing|drift/)
+  ]) assert.throws(()=>inspectWindowsNativeRequireSources([...sources,{path:'dist/worker/worker.mjs',source:workerSource()}]),/exactly one|patch missing|drift/)
 })
 
 async function nativeArchive(t, {platform='win32', source=nativeSource(WINDOWS_NATIVE_REQUIRE_PATCHED)}={}) {
@@ -233,6 +245,8 @@ async function nativeArchive(t, {platform='win32', source=nativeSource(WINDOWS_N
   const templates=join(engine,'docs/reference/templates');await mkdir(templates,{recursive:true})
   for(const name of ['AGENTS.md','SOUL.md','TOOLS.md','IDENTITY.md','USER.md','BOOTSTRAP.md']) await writeFile(join(templates,name),'Uniopc template')
   await writeFile(join(engine,'dist/loader-hash.js'),source)
+  await mkdir(join(engine,'dist/worker'),{recursive:true})
+  await writeFile(join(engine,'dist/worker/worker.mjs'),workerSource())
   const output=join(root,'output');await mkdir(output)
   const archive=`uniopc-engine-runtime-${platform}-x64.tar.gz`
   execFileSync('tar',['-czf',join(output,archive),'-C',join(root,'stage'),'tools'])
@@ -251,6 +265,10 @@ test('Windows cached archive verifier rejects missing/unpatched/duplicate/drifte
     const fixture=await nativeArchive(t,{source})
     await assert.rejects(verifyRuntimeDirectory(fixture.output),/exactly one|patch missing/)
   }
+  await writeFile(join(valid.engine,'dist/worker/worker.mjs'),workerSource(false))
+  execFileSync('tar',['-czf',join(valid.output,'uniopc-engine-runtime-win32-x64.tar.gz'),'-C',join(valid.root,'stage'),'tools'])
+  await assert.rejects(verifyRuntimeDirectory(valid.output),/worker compatibility patch missing/)
+  await writeFile(join(valid.engine,'dist/worker/worker.mjs'),workerSource())
   await writeFile(join(valid.engine,'dist/duplicate.js'),nativeSource(WINDOWS_NATIVE_REQUIRE_PATCHED))
   execFileSync('tar',['-czf',join(valid.output,'uniopc-engine-runtime-win32-x64.tar.gz'),'-C',join(valid.root,'stage'),'tools'])
   await assert.rejects(verifyRuntimeDirectory(valid.output),/exactly one/)
@@ -261,4 +279,43 @@ test('Windows cached archive verifier rejects missing/unpatched/duplicate/drifte
 test('Windows builder existing-size skip rejects an unpatched cached archive before returning success', {skip:process.platform!=='win32'}, async t => {
   const fixture=await nativeArchive(t,{source:nativeSource(WINDOWS_NATIVE_REQUIRE_ORIGINAL)})
   await assert.rejects(buildOpenclawRuntimeBundle({outputDir:fixture.output,platform:'win32',arch:'x64'}),/patch missing/)
+})
+
+test('dual loader roles reject missing, duplicate, nested, string/comment worker copies and prefix/block drift', () => {
+  const main=sourceEntry(nativeSource(WINDOWS_NATIVE_REQUIRE_PATCHED))
+  const original=workerSource(false),patched=workerSource()
+  const entry=source=>({path:'dist/worker/worker.mjs',source})
+  assert.equal(inspectWindowsNativeRequireSources([main,entry(patched)]).length,2)
+  assert.throws(()=>inspectWindowsNativeRequireSources([main]),/worker helper/)
+  assert.throws(()=>inspectWindowsNativeRequireSources([main,entry(original)]),/worker compatibility patch missing/)
+  assert.equal(inspectWindowsNativeRequireSources([main,entry(original)],{allowUnpatched:true})[1].role,'worker')
+  for(const source of [
+    patched.replace('openClawRootFsSync','changedRootFs'),
+    patched.replace('isSourceTransformFallbackError(_n,Ot)','isSourceTransformFallbackError(_n,Zt)'),
+    patched.replace('kn?.deregister()','void kn'),
+    workerPrefixFixture+'\n/*'+patched.slice(workerPrefixFixture.length)+'*/',
+    workerPrefixFixture+'\nconst stringCopy='+JSON.stringify(patched.slice(workerPrefixFixture.length))+';',
+    workerPrefixFixture+'\nfunction nested(){'+patched.slice(workerPrefixFixture.length)+'}',
+    workerPrefixFixture+'\nfunction nested(){'+patched.slice(workerPrefixFixture.length)+'}const tryNativeRequireJavaScriptModule=0;',
+    patched.replace(WINDOWS_WORKER_NATIVE_REQUIRE_PATCHED,'/* helper moved out */')+'function outer(){'+WINDOWS_WORKER_NATIVE_REQUIRE_PATCHED+'}',
+  ]) assert.throws(()=>inspectWindowsNativeRequireSources([main,entry(source)]),/drift|exactly one|patch missing/)
+  assert.throws(()=>inspectWindowsNativeRequireSources([main,entry(patched),{path:'dist/third.js',source:WINDOWS_WORKER_NATIVE_REQUIRE_PATCHED}]),/exactly one/)
+  assert.throws(()=>inspectWindowsNativeRequireSources([main,entry(patched+';const tryNativeRequireJavaScriptModule=0;')]),/top-level/)
+})
+
+test('standalone Windows archive verifier and VM uniqueness checks work without node_modules and never evaluate worker code', async t => {
+  const fixture=await nativeArchive(t)
+  const marker=join(fixture.root,'must-not-evaluate')
+  await writeFile(join(fixture.engine,'dist/worker/worker.mjs'),workerSource()
+    +';fs.writeFileSync('+JSON.stringify(marker)+',"bad");throw new Error("must not evaluate");')
+  execFileSync('tar',['-czf',join(fixture.output,'uniopc-engine-runtime-win32-x64.tar.gz'),'-C',join(fixture.root,'stage'),'tools'])
+  const script=join(fixture.root,'verify.mjs')
+  await writeFile(script,await readFile(new URL('./verify-uniopc-whitelabel-runtime.mjs',import.meta.url)))
+  const env={...process.env}
+  for(const key of Object.keys(env))if(['NODE_PATH','NODE_OPTIONS'].includes(key.toUpperCase()))delete env[key]
+  assert.ok(!(await readdir(fixture.root)).includes('node_modules'))
+  const result=execFileSync(process.execPath,[await realpath(script),fixture.output],
+    {cwd:fixture.root,env,encoding:'utf8',stdio:['ignore','pipe','pipe'],timeout:30000})
+  assert.match(result,/branding verified \(1 artifact\(s\)\)/)
+  await assert.rejects(readFile(marker),error=>error.code==='ENOENT')
 })
