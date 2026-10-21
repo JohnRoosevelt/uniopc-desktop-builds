@@ -13,7 +13,19 @@ fn main() {
     println!("cargo:rerun-if-changed=employee-icons/128x128@2x.png");
     println!("cargo:rerun-if-changed=employee-icons/icon.icns");
     println!("cargo:rerun-if-changed=employee-icons/icon.ico");
-    tauri_build::build()
+    let windows_msvc = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+        && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
+    let attributes = if windows_msvc {
+        // Apply the dependency to every linked executable, including libtests.
+        // The linker owns the manifest so Tauri must not embed a second copy.
+        println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
+        println!("cargo:rustc-link-arg=/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'");
+        tauri_build::Attributes::new()
+            .windows_attributes(tauri_build::WindowsAttributes::new_without_app_manifest())
+    } else {
+        tauri_build::Attributes::new()
+    };
+    tauri_build::try_build(attributes).expect("failed to build Tauri application");
 }
 
 fn uniopc_openclaw_version_from_manifest() -> Option<String> {
