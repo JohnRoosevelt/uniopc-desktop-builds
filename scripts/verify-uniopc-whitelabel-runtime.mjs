@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import assert from 'node:assert/strict'
-import { parse } from '@babel/parser'
+import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -48,38 +48,52 @@ export const WINDOWS_NATIVE_REQUIRE_PATCHED = WINDOWS_NATIVE_REQUIRE_ORIGINAL.re
 \tif (!isJavaScriptModulePath(modulePath))`,
 )
 
+// These byte contracts cover the complete installed 2026.8.1 prefix (byte 0
+// through the native region boundary) and the entire native region, including
+// alias hooks and error classification. They also prove the helper is top-level
+// without importing a parser before npm ci. Any upstream drift needs review.
+const NATIVE_REGION = '//#region src/plugins/native-module-require.ts'
+const NATIVE_PREFIX_SHA256 = '50d9c9cfbd6565ebf4bc5551a8029761357f1d91731bf54745eab6119778699d'
+const NATIVE_REGION_ORIGINAL_SHA256 = 'fed9aad37254cca350ad67285fbd6ceb8b934267da59f3f206ffb21349a9e93f'
+const NATIVE_REGION_PATCHED_SHA256 = '94896ad71ef20c109e9aba0225e2749c30561436efc184a8db73967c422260c6'
+const nativeDigest = value => createHash('sha256').update(value, 'utf8').digest('hex')
+// Count even commented/generator declaration spellings outside the pinned
+// region; a second declaration must never evade uniqueness through trivia.
+const nativeTrivia = String.raw`(?:\s|/\*[\s\S]*?\*/|//[^\r\n]*)*`
+const nativeDeclaration = String.raw`\bfunction${nativeTrivia}\*?${nativeTrivia}tryNativeRequireJavaScriptModule${nativeTrivia}\(`
+
 export function inspectWindowsNativeRequireSources(sources, { allowUnpatched = false } = {}) {
-  const helpers = []
+  const declarations = []
+  const regions = []
   for (const entry of sources) {
-    if (!entry.source.includes('tryNativeRequireJavaScriptModule')) continue
-    const ast = parse(entry.source, { sourceType: 'module' })
-    const visit = node => {
-      if (!node || typeof node !== 'object') return
-      if (node.type === 'FunctionDeclaration' && node.id?.name === 'tryNativeRequireJavaScriptModule') {
-        helpers.push({ ...entry, start: node.start, end: node.end, body: entry.source.slice(node.start, node.end), ast, topLevel: ast.program.body.includes(node) })
-      }
-      for (const value of Object.values(node)) {
-        if (Array.isArray(value)) value.forEach(visit)
-        else if (value && typeof value === 'object') visit(value)
-      }
+    for (const match of entry.source.matchAll(new RegExp(nativeDeclaration, 'g'))) {
+      declarations.push({ ...entry, start: match.index })
     }
-    visit(ast.program)
+    for (const match of entry.source.matchAll(/\/\/#region src\/plugins\/native-module-require\.ts/g)) {
+      regions.push({ path: entry.path, start: match.index })
+    }
   }
-  assert.equal(helpers.length, 1, 'Windows native loader requires exactly one helper')
-  const helper = helpers[0]
-  assert.ok(helper.topLevel, 'Windows native loader helper declaration drift')
-  const region = '//#region src/plugins/native-module-require.ts'
-  const regionStart = helper.source.indexOf(region)
-  assert.ok(regionStart >= 0 && regionStart === helper.source.lastIndexOf(region)
-    && regionStart < helper.start && helper.source.indexOf('//#endregion', regionStart) >= helper.end,
-  'Windows native loader region drift')
-  assert.ok(helper.ast.program.body.some(node => node.type === 'ImportDeclaration'
-    && node.source.value === 'node:url' && node.specifiers.some(specifier => specifier.type === 'ImportSpecifier'
-      && specifier.imported.name === 'fileURLToPath' && specifier.local.name === 'fileURLToPath')),
-  'Windows native loader fileURLToPath import drift')
-  assert.ok(helper.body === WINDOWS_NATIVE_REQUIRE_PATCHED || (allowUnpatched && helper.body === WINDOWS_NATIVE_REQUIRE_ORIGINAL),
-    'Windows native loader compatibility patch missing or structure drifted')
-  return helper
+  assert.equal(declarations.length, 1, 'Windows native loader requires exactly one helper')
+  assert.equal(regions.length, 1, 'Windows native loader region drift')
+  const helper = declarations[0]
+  const regionStart = helper.source.indexOf(NATIVE_REGION)
+  assert.ok(regions[0].path === helper.path && regionStart >= 0 && regionStart < helper.start,
+    'Windows native loader region drift')
+  const prefix = helper.source.slice(0, regionStart)
+  assert.equal(prefix.split('import { fileURLToPath, pathToFileURL } from "node:url";').length - 1, 1,
+    'Windows native loader unaliased fileURLToPath import drift')
+  assert.equal(nativeDigest(prefix), NATIVE_PREFIX_SHA256, 'Windows native loader prefix structure drift')
+  const regionEnd = helper.source.indexOf('//#endregion', regionStart)
+  assert.ok(regionEnd >= helper.start, 'Windows native loader region drift')
+  const region = helper.source.slice(regionStart, regionEnd + '//#endregion'.length)
+  const digest = nativeDigest(region)
+  assert.ok(digest === NATIVE_REGION_PATCHED_SHA256
+    || (allowUnpatched && digest === NATIVE_REGION_ORIGINAL_SHA256),
+  'Windows native loader compatibility patch missing or region structure drifted')
+  const body = digest === NATIVE_REGION_PATCHED_SHA256 ? WINDOWS_NATIVE_REQUIRE_PATCHED : WINDOWS_NATIVE_REQUIRE_ORIGINAL
+  assert.equal(helper.source.slice(helper.start, helper.start + body.length), body,
+    'Windows native loader helper structure drift')
+  return { ...helper, end: helper.start + body.length, body }
 }
 
 export function assertRuntimeEntryNamesBranded(names) {

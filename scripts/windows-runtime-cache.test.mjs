@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, writeFile, rm, readFile, symlink } from 'node:fs/promises'
+import { mkdtemp, mkdir, writeFile, rm, readFile, readdir, realpath, symlink } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, dirname, resolve } from 'node:path'
 import { execFileSync } from 'node:child_process'
@@ -117,4 +117,43 @@ test('cache validation checks real hashes before branding and propagates all fai
   assert.equal(branded, 1)
   await rm(join(root, RUNTIME_CACHE_PATHS[0]))
   await assert.rejects(verifyCachedRuntime(opts), /ENOENT/)
+})
+
+test('actual cache key, seed-key and verifier CLIs load in an isolated repo before npm install', async t => {
+  const {root:temporaryRoot}=await fixture(t)
+  const root=await realpath(temporaryRoot)
+  // Copy only the real seed guard's Node-only import closure. These modules are
+  // loaded by the actual seed-key CLI, not substitutes for production code.
+  for(const file of [
+    'public-release-guard.mjs','desktop-release-candidate.mjs','desktop-candidate-promotion.mjs',
+    'desktop-release-settings.mjs','prepare-desktop-updater-release.mjs',
+    'check-updater-signing-keys.mjs','ci-publish-desktop-artifacts.mjs','release-desktop-updater.mjs',
+  ]) await writeFile(join(root,'scripts',file),await readFile(join(sourceRoot,'scripts',file)))
+  execFileSync('git',['init','--quiet',root])
+  const sourceObjects=execFileSync('git',['rev-parse','--git-path','objects'],{cwd:sourceRoot,encoding:'utf8'}).trim()
+  await writeFile(join(root,'.git/objects/info/alternates'),resolve(sourceRoot,sourceObjects)+'\n')
+  const head=execFileSync('git',['rev-parse','HEAD'],{cwd:sourceRoot,encoding:'utf8'}).trim()
+  await mkdir(join(root,'.git/refs/remotes/origin'),{recursive:true})
+  await writeFile(join(root,'.git/refs/remotes/origin/main'),head+'\n')
+  const env={...process.env,GITHUB_REPOSITORY:'JohnRoosevelt/uniopc-desktop-builds',
+    GITHUB_ACTOR:'JohnRoosevelt',GITHUB_TRIGGERING_ACTOR:'JohnRoosevelt',
+    GITHUB_SHA:head,GITHUB_EVENT_NAME:'push',GITHUB_REF:'refs/heads/main'}
+  for(const key of Object.keys(env)) if(['NODE_PATH','NODE_OPTIONS','GITHUB_OUTPUT','GIT_DIR','GIT_WORK_TREE'].includes(key.toUpperCase())) delete env[key]
+  const run=(script,args=[])=>execFileSync(process.execPath,[join(root,'scripts',script),...args],
+    {cwd:root,env,encoding:'utf8',stdio:['ignore','pipe','pipe'],timeout:30000}).trim()
+  assert.ok(!(await readdir(root)).includes('node_modules'))
+  const expected=await runtimeCacheKey({projectRoot:root})
+  assert.equal(run('windows-runtime-cache.mjs',['key']),expected)
+  assert.equal(run('windows-runtime-cache.mjs',['seed-key']),'No compatible legacy seed; fresh build required')
+  assert.equal(await legacySeedKey({projectRoot:root}),'')
+  // Verifier exercises the real extracted archive path with built-ins only.
+  const runtime=join(root,'src-tauri/resources/uniopc-engine-runtime')
+  const stage=join(root,'verifier-stage/tools/node/node_modules/uniopc-engine/docs/reference/templates')
+  await mkdir(stage,{recursive:true});await mkdir(runtime,{recursive:true})
+  for(const name of ['AGENTS.md','SOUL.md','TOOLS.md','IDENTITY.md','USER.md','BOOTSTRAP.md']) await writeFile(join(stage,name),'Uniopc template')
+  execFileSync('tar',['-czf',join(runtime,'uniopc-engine-runtime-darwin-x64.tar.gz'),'-C',join(root,'verifier-stage'),'tools'])
+  await writeFile(join(runtime,'uniopc-engine-runtime.catalog.json'),JSON.stringify({artifacts:[{platform:'darwin',arch:'x64',archive:'uniopc-engine-runtime-darwin-x64.tar.gz'}]}))
+  assert.match(run('verify-uniopc-whitelabel-runtime.mjs',[runtime]),/branding verified \(1 artifact\(s\)\)/)
+  assert.ok(!(await readdir(root)).includes('node_modules'))
+  assert.equal((await runtimeProjection({projectRoot:root})).modules.length,5)
 })

@@ -284,6 +284,35 @@ test('patches local media refs into the pinned OpenClaw 2026.8.1 runtime sources
 
 // Verbatim 2026.8.1 native/cache routines from the installed runtime. Modules,
 // dependencies and fallback factory below are real temporary test artifacts.
+const nativePrefixFixture = [
+  "import { c as isRecord } from \"./record-coerce-DItp3I4t.js\";",
+  "import { t as sameFileIdentity } from \"./file-identity-CaVBmM56.js\";",
+  "import { a as isPathInside } from \"./path-D138yf8v.js\";",
+  "import \"./fs-safe-gVoExnQ2.js\";",
+  "import { i as openRootFileSync } from \"./root-file-B4L4VJ7-.js\";",
+  "import { t as isPathStrictlyInside } from \"./path-guards-CQoZeoCG.js\";",
+  "import \"./boundary-file-read-h_n3tTfV.js\";",
+  "import { a as getPluginCache, f as withPluginCache, n as bindPluginCacheRoot, o as getPluginCacheRoot, p as getPluginSdkHostFacts, s as getPluginCacheSource } from \"./plugin-cache-DMPn6vOK.js\";",
+  "import { a as pluginCacheRealpathSync, r as pluginCacheExistsSync } from \"./plugin-cache-files-Bob4xqJ3.js\";",
+  "import { a as listWorkspacePackageExportAliasEntries, c as resolvePluginLoaderTryNative, i as isPluginSdkAliasSpecifier, n as buildPluginLoaderJitiOptions, o as preparePluginLoaderAliases, r as createPluginLoaderModuleCacheKey } from \"./sdk-alias-BgJEvT_m.js\";",
+  "import Module, { createRequire } from \"node:module\";",
+  "import { fileURLToPath, pathToFileURL } from \"node:url\";",
+  "import fs from \"node:fs\";",
+  "import path from \"node:path\";",
+  "//#region src/shared/import-specifier.ts",
+  "/**",
+  "* On Windows, Node's ESM loader requires absolute paths to be expressed as",
+  "* file:// URLs. Raw drive-letter paths like C:\\... are parsed as URL schemes.",
+  "*/",
+  "function toSafeImportPath(specifier) {",
+  "\tif (process.platform !== \"win32\") return specifier;",
+  "\tif (specifier.startsWith(\"file://\")) return specifier;",
+  "\tif (path.win32.isAbsolute(specifier)) return pathToFileURL(specifier, { windows: true }).href;",
+  "\treturn specifier;",
+  "}",
+  "//#endregion",
+  ""
+].join('\n')
 const nativeLoaderFixture = [
   "//#region src/plugins/native-module-require.ts",
   "const nodeRequire = createRequire(import.meta.url);",
@@ -445,10 +474,18 @@ const toSourceTransformImportPath=target=>target;
 const buildPluginLoaderJitiOptions=alias=>({alias,nativeModules:['openclaw']});
 const loadCreateJitiLoaderFactory=()=>{throw new Error('fixture requires explicit fallback factory')};
 `
-  writeFileSync(file, prelude + nativeLoaderFixture + cacheDependencies + cachedLoaderFixture
-    + '\nexport {tryNativeRequireJavaScriptModule,clearPluginModuleRequireCache,withNativeRequireAliases,createPluginModuleLoader};')
+  writeFileSync(file, nativePrefixFixture + nativeLoaderFixture + '\n')
   await patchWindowsNativeModuleRequire(prefix)
-  const loader = await import(pathToFileURL(file).href)
+  const patchedStage = readFileSync(file, 'utf8')
+  const regionStart = patchedStage.indexOf('//#region src/plugins/native-module-require.ts')
+  const executionRegion = patchedStage.slice(regionStart).trimEnd()
+  assert.equal(executionRegion, nativeLoaderFixture.replace(WINDOWS_NATIVE_REQUIRE_ORIGINAL, WINDOWS_NATIVE_REQUIRE_PATCHED))
+  // Runtime imports outside this region are intentionally absent in this tiny
+  // fixture. Execute a separate harness with the exact verified patched region.
+  const harness = join(prefix, 'execution-harness.mjs')
+  writeFileSync(harness, prelude + executionRegion + cacheDependencies + cachedLoaderFixture
+    + '\nexport {tryNativeRequireJavaScriptModule,clearPluginModuleRequireCache,withNativeRequireAliases,createPluginModuleLoader};')
+  const loader = await import(pathToFileURL(harness).href)
   return { prefix, dist, file, loader }
 }
 
