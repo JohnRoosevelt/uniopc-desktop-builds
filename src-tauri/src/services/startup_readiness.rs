@@ -423,6 +423,8 @@ mod tests {
         desired: Value,
         preserve_tools: bool,
         verify_delay: Duration,
+        http_fixture: Option<(crate::services::openclaw_gateway::GatewayEndpoint, std::sync::Arc<tokio::sync::Notify>)>,
+        http_errors: std::sync::atomic::AtomicUsize,
         state: Mutex<State>,
     }
     impl Fake {
@@ -438,6 +440,8 @@ mod tests {
                 desired: json!({"env":{"vars":{"APP":"ready"}}}),
                 preserve_tools: false,
                 verify_delay: Duration::ZERO,
+                http_fixture: None,
+                http_errors: std::sync::atomic::AtomicUsize::new(0),
                 state: Mutex::new(State {
                     config: json!({}),
                     revision: 1,
@@ -479,6 +483,14 @@ mod tests {
         async fn http_ready(&self) -> Result<bool, String> {
             if self.hung == "http" {
                 std::future::pending::<()>().await;
+            }
+            if let Some((endpoint, recovered)) = &self.http_fixture {
+                let result = crate::services::openclaw_gateway::http_ready_for_endpoint(endpoint).await;
+                if result.is_err() {
+                    self.http_errors.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    recovered.notify_one();
+                }
+                return result;
             }
             Ok(self.began.elapsed() >= self.http_at)
         }
@@ -655,6 +667,93 @@ mod tests {
         }
         fn auth_repair_needed(&self, error: &str) -> bool {
             error.contains("password_mismatch")
+        }
+    }
+
+    // A real socket fault is armed only after defaults and plugins complete.
+    // Keep faulting until the production helper returns an error, so a hidden
+    // HTTP client retry cannot accidentally satisfy this regression test.
+    #[tokio::test]
+    async fn http_readiness_final_probe_transport_recovers_without_replaying_ack() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use std::sync::{Arc, atomic::Ordering};
+        for fault in ["close", "truncated"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let recovered = Arc::new(tokio::sync::Notify::new());
+            let mut fake = Fake::new();
+            fake.http_fixture = Some((crate::services::openclaw_gateway::GatewayEndpoint {
+                url: format!("ws://{address}"), token: None, password: None, device_token: None,
+            }, recovered.clone()));
+            let fake = Arc::new(fake);
+            let server_fake = fake.clone();
+            let server = tokio::spawn(async move {
+                let mut fault_observed = false;
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut buffer = [0; 4096];
+                    socket.read(&mut buffer).await.unwrap();
+                    let final_probe = server_fake.state.lock().unwrap().plugins > 0;
+                    if final_probe && !fault_observed {
+                        if fault == "truncated" {
+                            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{\"ready\":").await.unwrap();
+                        }
+                        drop(socket);
+                        // Wait for the helper's result, while still accepting
+                        // any transparent retry and giving it the same fault.
+                        tokio::select! {
+                            _ = recovered.notified() => fault_observed = true,
+                            _ = tokio::task::yield_now() => {}
+                        }
+                    } else {
+                        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\nConnection: close\r\n\r\n{\"ready\":true}").await.unwrap();
+                    }
+                    if server_fake.http_errors.load(Ordering::SeqCst) > 0 {
+                        fault_observed = true;
+                    }
+                }
+            });
+            let result = tokio::time::timeout(Duration::from_secs(5), start(fake.as_ref(), false, false, Duration::from_secs(3))).await.unwrap().unwrap();
+            assert_eq!(result.snapshot, "connected");
+            assert!(fake.http_errors.load(Ordering::SeqCst) > 0, "fault must cross production helper");
+            let state = fake.state.lock().unwrap();
+            assert_eq!(state.spawns, 1);
+            assert_eq!(state.patches.len(), 1);
+            assert_eq!(state.plugins, 1);
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn http_readiness_continuous_fault_obeys_original_deadline_cancel_and_exit() {
+        use tokio::io::AsyncReadExt;
+        for ending in ["deadline", "cancel", "exit"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut buffer = [0; 4096];
+                    let _ = socket.read(&mut buffer).await;
+                    // EOF before response headers, on every request.
+                }
+            });
+            let mut fake = Fake::new();
+            fake.http_fixture = Some((crate::services::openclaw_gateway::GatewayEndpoint {
+                url: format!("ws://{address}"), token: None, password: None, device_token: None,
+            }, std::sync::Arc::new(tokio::sync::Notify::new())));
+            if ending == "cancel" { fake.cancel_at = Some(Duration::from_millis(100)); }
+            if ending == "exit" { fake.exit_at = Some(Duration::from_millis(100)); }
+            let error = start(&fake, false, false, Duration::from_millis(700)).await.err().unwrap();
+            assert_eq!(error, match ending {
+                "cancel" => "cancelled", "exit" => CHILD_EXIT_ERROR, _ => DEADLINE_ERROR,
+            });
+            assert!(fake.http_errors.load(std::sync::atomic::Ordering::SeqCst) > 0);
+            assert!(fake.began.elapsed() < Duration::from_secs(2));
+            let state = fake.state.lock().unwrap();
+            assert_eq!(state.spawns, 1);
+            assert!(state.patches.is_empty());
+            server.abort();
         }
     }
 

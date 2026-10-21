@@ -540,15 +540,63 @@ pub async fn http_ready_for_endpoint(endpoint: &GatewayEndpoint) -> Result<bool,
         .get(&url)
         .send()
         .await
-        .map_err(|error| {
-            if error.is_connect() || error.is_timeout() {
-                "gateway_transport_unavailable".to_string()
-            } else { "gateway_http_readiness_failed".to_string() }
-        })?;
+        .map_err(|error| readiness_transport_error("send", &error))?;
     if !response.status().is_success() { return Ok(false); }
-    let body = response.json::<Value>().await
+    // reqwest labels interrupted body collection as decode errors too. Read
+    // the full bytes first so only complete JSON is a schema decision.
+    let bytes = response.bytes().await
+        .map_err(|error| readiness_transport_error("body", &error))?;
+    let body: Value = serde_json::from_slice(&bytes)
         .map_err(|_| "gateway_http_readiness_schema_invalid".to_string())?;
     Ok(body.get("ready").and_then(Value::as_bool) == Some(true))
+}
+
+fn readiness_transport_error(phase: &str, error: &reqwest::Error) -> String {
+    // Never format the error or its sources: they can contain URLs or secrets.
+    let mut source = std::error::Error::source(error);
+    let mut io_kind = None;
+    while let Some(cause) = source {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            io_kind = Some(io.kind());
+            break;
+        }
+        source = cause.source();
+    }
+    // A missing listener can be polled for 900 seconds. Keep diagnostics
+    // bounded both in memory and frequency, without writing on every poll.
+    type DiagnosticKey = (bool, u8, Option<std::io::ErrorKind>);
+    static DIAGNOSTICS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<DiagnosticKey, std::time::Instant>>> = std::sync::OnceLock::new();
+    let flags = u8::from(error.is_builder())
+        | (u8::from(error.is_connect()) << 1)
+        | (u8::from(error.is_timeout()) << 2)
+        | (u8::from(error.is_request()) << 3)
+        | (u8::from(error.is_body()) << 4)
+        | (u8::from(error.is_decode()) << 5);
+    let key = (phase == "body", flags, io_kind);
+    let should_log = DIAGNOSTICS.get_or_init(Default::default).lock().ok().is_some_and(|mut seen| {
+        let now = std::time::Instant::now();
+        if let Some(last) = seen.get_mut(&key) {
+            if now.duration_since(*last) < Duration::from_secs(30) { return false; }
+            *last = now;
+        } else {
+            if seen.len() >= 32 { return false; }
+            seen.insert(key, now);
+        }
+        true
+    });
+    if should_log {
+        eprintln!(
+            "gateway_http_readiness phase={phase} builder={} connect={} timeout={} request={} body={} decode={} io_kind={io_kind:?}",
+            error.is_builder(), error.is_connect(), error.is_timeout(), error.is_request(), error.is_body(), error.is_decode()
+        );
+    }
+    if !error.is_builder()
+        && (phase == "body" || error.is_connect() || error.is_timeout() || error.is_request() || error.is_body())
+    {
+        "gateway_transport_unavailable".into()
+    } else {
+        "gateway_http_readiness_failed".into()
+    }
 }
 
 fn http_base_from_ws_url(url: &str) -> String {
@@ -2048,20 +2096,43 @@ mod tests {
     #[tokio::test]
     async fn http_readiness_requires_literal_ready_true() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        for (body, expected) in [(r#"{"ready":false}"#, false), (r#"{"ready":true}"#, true), (r#"{"ok":true}"#, false)] {
+        for (status, body, expected) in [("200 OK", r#"{"ready":false}"#, false), ("200 OK", r#"{"ready":true}"#, true), ("200 OK", r#"{"ok":true}"#, false), ("503 Service Unavailable", r#"{"ready":true}"#, false)] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let port = listener.local_addr().unwrap().port();
             let server = tokio::spawn(async move {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut buffer = [0u8; 4096];
                 socket.read(&mut buffer).await.unwrap();
-                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                let response = format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
                 socket.write_all(response.as_bytes()).await.unwrap();
             });
             let endpoint = GatewayEndpoint { url: format!("ws://127.0.0.1:{port}"), token: None, password: None, device_token: None };
             assert_eq!(http_ready_for_endpoint(&endpoint).await.unwrap(), expected);
             server.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn http_readiness_invalid_json_and_builder_error_are_permanent() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0; 4096];
+            socket.read(&mut buffer).await.unwrap();
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\ninvalid").await.unwrap();
+        });
+        for (url, expected) in [
+            (format!("ws://{address}"), "gateway_http_readiness_schema_invalid"),
+            ("http://[invalid".to_string(), "gateway_http_readiness_failed"),
+        ] {
+            let endpoint = GatewayEndpoint { url, token: None, password: None, device_token: None };
+            let error = http_ready_for_endpoint(&endpoint).await.unwrap_err();
+            assert_eq!(error, expected);
+            assert!(!crate::services::startup_readiness::transient(&error));
+        }
+        server.await.unwrap();
     }
 
     #[test]
