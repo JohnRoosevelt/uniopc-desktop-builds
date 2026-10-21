@@ -274,13 +274,19 @@ export async function verifyRuntimeDirectory(runtimeDirectory = RUNTIME_DIR) {
       await walk(stage, async path => {
         const rel = path.slice(stage.length + 1).replaceAll('\\', '/')
         const normalized = rel.replace(/^\.\//, '')
+        const nativeCandidate = artifact.platform === 'win32' && BRANDED_ENGINE_ROOT.test(normalized)
+          && /\/uniopc-engine\/dist\/.*\.[cm]?js$/i.test(normalized) && !/\/node_modules\//.test(normalized.split('/uniopc-engine/')[1])
+        // Native contracts inspect bytes independently of branding's readability
+        // heuristic: a literal replacement character is valid UTF-8 source.
+        if (nativeCandidate) {
+          const nativeBytes = await readFile(path).catch(() => assert.fail(`Unreadable Windows native loader candidate: ${normalized}`))
+          assert.ok(!nativeBytes.includes(0), `NUL in Windows native loader candidate: ${normalized}`)
+          const source = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(nativeBytes)
+          nativeLoaderSources.push({ path: normalized, source })
+        }
         const bytes = await readFile(path).catch(() => null)
         if (bytes === null || !isReadableText(bytes)) return
         const text = bytes.toString('utf8')
-        if (artifact.platform === 'win32' && BRANDED_ENGINE_ROOT.test(normalized)
-          && /\/uniopc-engine\/dist\/.*\.[cm]?js$/i.test(normalized) && !/\/node_modules\//.test(normalized.split('/uniopc-engine/')[1])) {
-          nativeLoaderSources.push({ path: normalized, source: text })
-        }
         const internalReason = classifyInternalTextPath(normalized)
         if (internalReason) {
           const count = countBrandOccurrences(text)

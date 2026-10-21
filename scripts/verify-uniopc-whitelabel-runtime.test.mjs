@@ -319,3 +319,32 @@ test('standalone Windows archive verifier and VM uniqueness checks work without 
   assert.match(result,/branding verified \(1 artifact\(s\)\)/)
   await assert.rejects(readFile(marker),error=>error.code==='ENOENT')
 })
+
+test('Windows native archive collection accepts literal U+FFFD independently of branding readability', async t => {
+  const fixture=await nativeArchive(t,{source:nativeSource(WINDOWS_NATIVE_REQUIRE_PATCHED)+'\nconst replacement="�";'})
+  await writeFile(join(fixture.engine,'dist/worker/worker.mjs'),workerSource()+'\nconst replacement="�";')
+  const repack=()=>execFileSync('tar',['-czf',join(fixture.output,'uniopc-engine-runtime-win32-x64.tar.gz'),'-C',join(fixture.root,'stage'),'tools'])
+  repack()
+  assert.equal((await verifyRuntimeDirectory(fixture.output)).artifactCount,1)
+  // A third helper must still count even when branding considers it unreadable.
+  await writeFile(join(fixture.engine,'dist/third.js'),nativeSource(WINDOWS_NATIVE_REQUIRE_PATCHED)+'\nconst replacement="�";')
+  repack()
+  await assert.rejects(verifyRuntimeDirectory(fixture.output),/exactly one readable helper/)
+})
+
+test('Windows native archive collection rejects invalid UTF-8, NUL and preserved BOM for either role', async t => {
+  for(const role of ['readable','worker']){
+    const fixture=await nativeArchive(t)
+    const file=join(fixture.engine,role==='readable'?'dist/loader-hash.js':'dist/worker/worker.mjs')
+    const original=await readFile(file)
+    for(const [bytes,error] of [
+      [Buffer.concat([original,Buffer.from('\n// '),Buffer.from([0xc3,0x28])]),/encoded data|encoding|utf-8/i],
+      [Buffer.concat([original,Buffer.from('\n// '),Buffer.from([0])]),/NUL in Windows native loader candidate/],
+      [Buffer.concat([Buffer.from([0xef,0xbb,0xbf]),original]),/prefix.*drift/],
+    ]){
+      await writeFile(file,bytes)
+      execFileSync('tar',['-czf',join(fixture.output,'uniopc-engine-runtime-win32-x64.tar.gz'),'-C',join(fixture.root,'stage'),'tools'])
+      await assert.rejects(verifyRuntimeDirectory(fixture.output),error,role)
+    }
+  }
+})
