@@ -263,6 +263,88 @@ pub(super) mod implementation {
         Ok(snapshot)
     }
 
+    pub(super) async fn official_bootstrap_snapshot(
+        app: &AppHandle,
+        profile: Option<&str>,
+    ) -> Result<OpenClawModelsSnapshot, String> {
+        let mut metrics = OfficialCommandMetrics::new(app, profile, "official_bootstrap_snapshot");
+        let started = std::time::Instant::now();
+        let config = openclaw_gateway::config_get(profile).await?;
+        let models = openclaw_gateway::configured_models_list(profile).await?;
+        let auth = openclaw_gateway::models_auth_status(profile, false).await?;
+        metrics.set("snapshotGatewayMs", started);
+        let local_auth = openclaw_agent_auth_store_for_profile(profile);
+        let local_snapshot = openclaw_models_snapshot_from_gateway_payloads_with_agent_auth(
+            &config,
+            &models,
+            &auth,
+            Some(&local_auth),
+        );
+        let mut snapshot =
+            official_bootstrap_snapshot_with_auth(&config, &models, &auth, local_snapshot, || async {
+                let started = std::time::Instant::now();
+                metrics.values.insert("authCliCount", 1);
+                let auth = openclaw_agent_auth_store_for_profile_with_cli(app, profile).await;
+                metrics.set("authCliMs", started);
+                auth
+            })
+            .await;
+        apply_codex_runtime_compatibility(profile, None, &mut snapshot);
+        metrics.succeeded = true;
+        Ok(snapshot)
+    }
+
+    // Emit one aggregate completion event, including on error. Never log payloads.
+    struct OfficialCommandMetrics<'a> {
+        app: &'a AppHandle,
+        profile: String,
+        phase: &'static str,
+        started: std::time::Instant,
+        values: std::collections::BTreeMap<&'static str, u64>,
+        succeeded: bool,
+    }
+    impl<'a> OfficialCommandMetrics<'a> {
+        fn new(app: &'a AppHandle, profile: Option<&'a str>, phase: &'static str) -> Self {
+            Self {
+                app,
+                profile: crate::services::uniopc_runtime_paths::resolve_profile_key(profile),
+                phase,
+                started: std::time::Instant::now(),
+                values: [
+                    ("snapshotGatewayMs", 0),
+                    ("authCliMs", 0),
+                    ("authCliCount", 0),
+                    ("statusPreMs", 0),
+                    ("configMs", 0),
+                    ("settleMs", 0),
+                    ("verifyMs", 0),
+                    ("clearAuthMs", 0),
+                    ("migrationMs", 0),
+                    ("statusPostMs", 0),
+                ]
+                .into_iter()
+                .collect(),
+                succeeded: false,
+            }
+        }
+        fn set(&mut self, key: &'static str, started: std::time::Instant) {
+            self.values
+                .insert(key, started.elapsed().as_millis() as u64);
+        }
+    }
+    impl Drop for OfficialCommandMetrics<'_> {
+        fn drop(&mut self) {
+            crate::services::engine_startup_metrics::record_startup_event(
+                self.app,
+                &self.profile,
+                self.phase,
+                if self.succeeded { "ready" } else { "failed" },
+                self.started.elapsed().as_millis() as u64,
+                serde_json::to_string(&self.values).ok(),
+            );
+        }
+    }
+
     fn openclaw_env_var_is_effective_in_config_file(
         profile: Option<&str>,
         key: &str,
@@ -613,6 +695,52 @@ pub(super) mod implementation {
         Ok(())
     }
 
+    async fn sync_official_agent_models_to_default(
+        app: &AppHandle,
+        profile: Option<&str>,
+        target_model: &str,
+        metrics: &mut OfficialCommandMetrics<'_>,
+    ) -> Result<(), String> {
+        let agents = openclaw_gateway::agents_list_json_with_device_auth(app, profile).await?;
+        let ready_models = official_agent_migration_ready_models(&agents, target_model, || async {
+            let started = std::time::Instant::now();
+            let config = openclaw_gateway::config_get(profile).await?;
+            let models = openclaw_gateway::configured_models_list(profile).await?;
+            let auth = openclaw_gateway::models_auth_status(profile, false).await?;
+            metrics.set("snapshotGatewayMs", started);
+            let started = std::time::Instant::now();
+            metrics.values.insert("authCliCount", 1);
+            let agent_auth = openclaw_agent_auth_store_for_profile_with_cli(app, profile).await;
+            metrics.set("authCliMs", started);
+            let mut snapshot = openclaw_models_snapshot_from_gateway_payloads_with_agent_auth(
+                &config,
+                &models,
+                &auth,
+                Some(&agent_auth),
+            );
+            apply_codex_runtime_compatibility(profile, None, &mut snapshot);
+            Ok(snapshot
+                .models
+                .into_iter()
+                .filter(|model| model.provider_ready)
+                .map(|model| model.model_ref)
+                .collect())
+        })
+        .await?;
+        for agent_id in agent_model_migration_targets(&agents, &ready_models, target_model) {
+            openclaw_gateway::agents_update_json(
+                profile,
+                &agent_id,
+                serde_json::json!({"model": target_model}),
+            )
+            .await
+            .map_err(|error| {
+                format!("Uniopc 引擎 已切换默认模型，但同步 AI 员工 `{agent_id}` 的模型失败：{error}")
+            })?;
+        }
+        Ok(())
+    }
+
     async fn sync_official_codex_auth_if_available(
         app: &AppHandle,
         profile: &str,
@@ -742,6 +870,7 @@ pub(super) mod implementation {
         api_key: &str,
         model_ref: &str,
         catalog_models: &[OpenClawOfficialCatalogModel],
+        metrics: &mut OfficialCommandMetrics<'_>,
     ) -> Result<(), String> {
         // `base_url` + `api_key` are the REAL upstream (mint output). Keep the token
         // in the loopback proxy's memory and point the gateway at the proxy instead —
@@ -752,6 +881,7 @@ pub(super) mod implementation {
         let proxy_base = crate::services::official_model_proxy::proxy_base_url()
             .ok_or_else(|| "本地模型反代尚未启动，无法接入官方模型。请稍后重试。".to_string())?;
         let proxy_secret = crate::services::official_model_proxy::proxy_shared_secret();
+        let started = std::time::Instant::now();
         let snapshot = config_get_with_gateway_recovery(profile).await?;
         let settle_action =
             official_model_gateway_settle_action(&snapshot, &proxy_base, proxy_secret);
@@ -762,9 +892,14 @@ pub(super) mod implementation {
             model_ref,
             catalog_models,
         );
-        match openclaw_gateway::config_patch(profile, patch).await {
+        let patched = openclaw_gateway::config_patch(profile, patch).await;
+        metrics.set("configMs", started);
+        match patched {
             Ok(_) => {
-                settle_official_model_gateway(app, settle_action).await?;
+                let started = std::time::Instant::now();
+                let settled = settle_official_model_gateway(app, settle_action).await;
+                metrics.set("settleMs", started);
+                settled?;
                 // The new config is in place and no apiKey references the old file
                 // secret anymore — best-effort delete the now-orphan token file the
                 // old scheme left on disk (unreferenced; harmless if already gone).
@@ -783,7 +918,10 @@ pub(super) mod implementation {
                 // Re-read config and confirm the provider actually landed; if it did
                 // not, surface a retryable error so the caller reconnects instead of
                 // reporting a phantom success.
-                match config_get_with_gateway_recovery(profile).await {
+                let started = std::time::Instant::now();
+                let verify = config_get_with_gateway_recovery(profile).await;
+                metrics.set("verifyMs", started);
+                match verify {
                     Ok(verify) if snapshot_has_official_provider_configured(&verify) => Ok(()),
                     Ok(_) => Err("官方模型接入未生效：Uniopc 引擎配置里未出现 uniopc-official provider（config.patch 可能在网关重启窗口被丢弃）。请重试接入。".to_string()),
                     // Can't re-read config right now (gateway momentarily
@@ -797,13 +935,14 @@ pub(super) mod implementation {
                 }
             }
             Err(error) if openclaw_gateway_patch_error_may_be_restarting(&error) => {
-                settle_official_model_gateway(app, settle_action)
-                    .await
-                    .map_err(|settle_error| format!("{error}\n{settle_error}"))?;
-                wait_for_openclaw_profile_default_model(profile, model_ref)
-                    .await
-                    .then_some(())
-                    .ok_or(error)
+                let started = std::time::Instant::now();
+                let settled = settle_official_model_gateway(app, settle_action).await;
+                metrics.set("settleMs", started);
+                settled.map_err(|settle_error| format!("{error}\n{settle_error}"))?;
+                let started = std::time::Instant::now();
+                let verified = wait_for_openclaw_profile_default_model(profile, model_ref).await;
+                metrics.set("verifyMs", started);
+                verified.then_some(()).ok_or(error)
             }
             Err(error) => Err(error),
         }
@@ -993,7 +1132,12 @@ pub(super) mod implementation {
         app: AppHandle,
         req: OpenClawUniopcOfficialRequest,
     ) -> Result<OpenClawInstallResult, String> {
+        let profile = normalize_openclaw_snapshot_profile(req.profile.as_deref());
+        let mut metrics =
+            OfficialCommandMetrics::new(&app, profile.as_deref(), "official_full_connect");
+        let started = std::time::Instant::now();
         let status = build_openclaw_status(&app).await;
+        metrics.set("statusPreMs", started);
         if !status.supported {
             return Err(status.message);
         }
@@ -1016,7 +1160,6 @@ pub(super) mod implementation {
             OPENCLAW_UNIOPC_OFFICIAL_PROVIDER,
             OPENCLAW_UNIOPC_OFFICIAL_DEFAULT_MODEL,
         );
-        let profile = normalize_openclaw_snapshot_profile(req.profile.as_deref());
         // Reconnecting the process-local official proxy is transport repair, not a
         // user model-selection action. Keep an existing official primary even if a
         // concurrent mint request carried the service default; this closes the late
@@ -1046,17 +1189,28 @@ pub(super) mod implementation {
             api_key,
             &target_model,
             &catalog_models,
+            &mut metrics,
         )
         .await?;
+        let started = std::time::Instant::now();
         let _ = clear_openclaw_provider_auth_failure_state(
             &app,
             profile.as_deref(),
             OPENCLAW_UNIOPC_OFFICIAL_PROVIDER,
         )
         .await;
-        sync_unavailable_agent_models_to_default(&app, profile.as_deref(), &target_model).await?;
+        metrics.set("clearAuthMs", started);
+        let started = std::time::Instant::now();
+        let migrated = sync_official_agent_models_to_default(
+            &app, profile.as_deref(), &target_model, &mut metrics,
+        ).await;
+        metrics.set("migrationMs", started);
+        migrated?;
 
+        let started = std::time::Instant::now();
         let next_status = build_openclaw_status(&app).await;
+        metrics.set("statusPostMs", started);
+        metrics.succeeded = true;
         Ok(OpenClawInstallResult {
             status: next_status,
             output_tail: None,
@@ -1690,6 +1844,15 @@ pub(super) mod implementation {
         })
     }
 }
+#[tauri::command]
+pub async fn openclaw_official_bootstrap_snapshot(
+    app: AppHandle,
+    profile: Option<String>,
+) -> Result<OpenClawModelsSnapshot, String> {
+    let profile = super::normalize_openclaw_snapshot_profile(profile.as_deref());
+    implementation::official_bootstrap_snapshot(&app, profile.as_deref()).await
+}
+
 #[tauri::command]
 pub async fn openclaw_models_snapshot(
     app: AppHandle,

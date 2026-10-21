@@ -119,3 +119,94 @@ test('official-model bootstrap repairs a configured stale loopback endpoint', ()
   assert.match(source, /if \(onOfficial && localProxyMismatch\) \{[\s\S]*?await connectUniopcOfficialModel\(\{ profile, model: localPrimaryModel \}\)/)
   assert.match(source, /model: selectedModel/)
 })
+
+async function loadOfficialModelForBehavior(invoke, mint = async () => ({ baseUrl: 'https://example.test', apiKey: 'test', model: 'uniopc-default' })) {
+  const source = fs.readFileSync(new URL('./uniopcOfficialModel.js', import.meta.url), 'utf8')
+    .replace(/^import .*$/gm, '')
+    .replace(/^export /gm, '')
+  return new Function('invoke', 'callSupabaseFunctionViaClient', 'supabase',
+    'isGatewayModelCredentialsUnavailable', 'shouldRecoverGatewayAuth',
+    `${source}\nreturn { maybeBootstrapUniopcOfficialModel, connectUniopcOfficialModel, getOfficialModelStatus, hasConfiguredModel };`,
+  )(invoke, mint, {}, () => false, () => false)
+}
+
+test('bootstrap invokes the dedicated snapshot with top-level profile and preserves supplied snapshots', async () => {
+  const calls = []
+  const api = await loadOfficialModelForBehavior(async (command, args) => {
+    calls.push([command, args])
+    if (command === 'official_model_local_profile_state') return null
+    if (command === 'openclaw_official_bootstrap_snapshot') return {
+      resolvedDefaultModel: 'custom-test/test', providers: [{ id: 'custom-test', ready: true, configured: true }],
+    }
+    throw new Error(`unexpected ${command}`)
+  })
+  await api.maybeBootstrapUniopcOfficialModel({ profile: 'profile-a' })
+  assert.deepEqual(calls.filter(([command]) => command.includes('snapshot')), [
+    ['openclaw_official_bootstrap_snapshot', { profile: 'profile-a' }],
+  ])
+  const before = calls.length
+  await api.maybeBootstrapUniopcOfficialModel({ profile: 'profile-b', snapshot: {
+    resolvedDefaultModel: 'custom-test/test', providers: [{ id: 'custom-test', ready: true, configured: true }],
+  } })
+  assert.equal(calls.length, before)
+})
+
+test('bootstrap shares one full connect per profile, serializes token owners, and propagates RPC failure', async () => {
+  let connects = 0
+  let mints = 0
+  const calls = []
+  const api = await loadOfficialModelForBehavior(async (command, args) => {
+    calls.push([command, args])
+    if (command === 'official_model_local_profile_state') return null
+    if (command === 'openclaw_official_bootstrap_snapshot') return {}
+    if (command === 'openclaw_use_uniopc_official_model') { connects += 1; return {} }
+    throw new Error(`unexpected ${command}`)
+  }, async () => { mints += 1; return { baseUrl: 'https://example.test', apiKey: 'test', model: 'uniopc-default' } })
+  await Promise.all([
+    api.maybeBootstrapUniopcOfficialModel({ profile: 'a' }),
+    api.maybeBootstrapUniopcOfficialModel({ profile: 'a' }),
+    api.maybeBootstrapUniopcOfficialModel({ profile: 'b' }),
+  ])
+  assert.equal(connects, 2)
+  assert.equal(mints, 2)
+  assert.deepEqual(calls.filter(([command]) => command === 'openclaw_use_uniopc_official_model').map(([, args]) => args.req.profile), ['a', 'b'])
+  const failing = await loadOfficialModelForBehavior(async command => {
+    if (command === 'official_model_local_profile_state') return null
+    throw new Error('rpc failed')
+  })
+  await assert.rejects(failing.maybeBootstrapUniopcOfficialModel({ profile: 'failed' }), /rpc failed/)
+  assert.notEqual(failing.getOfficialModelStatus().state, 'connected')
+})
+
+
+test('official snapshot classification retains missing-provider bootstrap and final default truthiness', async () => {
+  const api = await loadOfficialModelForBehavior(async () => { throw new Error('unexpected IPC') })
+  for (const snapshot of [{}, { primaryModel: 'raw' }, { resolvedDefaultModel: '  ', primaryModel: 'custom-test/test' }]) {
+    assert.equal(api.hasConfiguredModel(snapshot), false)
+  }
+  assert.equal(api.hasConfiguredModel({ primaryModel: 'uniopc-official/test', providers: [] }), false)
+  assert.equal(api.hasConfiguredModel({ primaryModel: 'uniopc-official/test', providers: [{ id: 'uniopc-official', configured: true }] }), true)
+})
+
+test('late selected model merges into one queued connect exactly once', async () => {
+  let releaseMint
+  let mintEntered
+  const entered = new Promise(resolve => { mintEntered = resolve })
+  const barrier = new Promise(resolve => { releaseMint = resolve })
+  const requests = []
+  const api = await loadOfficialModelForBehavior(async (command, args) => {
+    if (command === 'openclaw_use_uniopc_official_model') { requests.push(args.req); return {} }
+    throw new Error(`unexpected ${command}`)
+  }, async () => {
+    mintEntered()
+    await barrier
+    return { baseUrl: 'https://example.test', apiKey: 'test', model: 'default' }
+  })
+  const first = api.connectUniopcOfficialModel({ profile: 'a' })
+  await entered
+  const late = api.connectUniopcOfficialModel({ profile: 'a', model: 'uniopc-official/selected' })
+  releaseMint()
+  await Promise.all([first, late])
+  assert.equal(requests.length, 1)
+  assert.equal(requests[0].model, 'uniopc-official/selected')
+})

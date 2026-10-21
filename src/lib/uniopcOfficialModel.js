@@ -336,11 +336,20 @@ async function connectUniopcOfficialModelUnguarded(request = {}) {
   const profile = request.profile
   const profileKey = String(profile || '').trim()
   setOfficialModelStatus('connecting', null, profileKey)
+  const started = Date.now()
+  let mintMs = 0
+  let mintCount = 0
   try {
     // callSupabaseFunctionViaClient returns the payload directly and throws on error.
     let data
     try {
-      data = await callSupabaseFunctionViaClient('mint-llm-token', { deviceId: officialModelDeviceId() })
+      const mintStarted = Date.now()
+      mintCount += 1
+      try {
+        data = await callSupabaseFunctionViaClient('mint-llm-token', { deviceId: officialModelDeviceId() })
+      } finally {
+        mintMs = Date.now() - mintStarted
+      }
     } catch (error) {
       throw new Error(error?.message || '无法连接 Uniopc 官方模型：令牌签发失败。')
     }
@@ -393,6 +402,8 @@ async function connectUniopcOfficialModelUnguarded(request = {}) {
     forgetActiveOfficialProvider(profileKey)
     setOfficialModelStatus('failed', error, profileKey)
     throw error
+  } finally {
+    console.info('[official-model] connect timing', { mintMs, mintCount, totalMs: Date.now() - started })
   }
 }
 
@@ -644,7 +655,7 @@ export async function maybeBootstrapUniopcOfficialModel({
       return { connected: false, deferred: true }
     }
 
-    const effectiveSnapshot = snapshot || (await invoke('openclaw_models_snapshot', { profile }))
+    const effectiveSnapshot = snapshot || (await invoke('openclaw_official_bootstrap_snapshot', { profile }))
     if (hasConfiguredModel(effectiveSnapshot)) {
       // The user's own provider is configured, or the official provider is
       // already in config. For the official case the upstream token lives only

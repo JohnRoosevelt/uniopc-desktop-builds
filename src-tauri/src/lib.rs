@@ -292,6 +292,7 @@ fn run_admin_host_app() {
         // model
         commands::model::runtime::openclaw_status,
         commands::model::models::openclaw_models_snapshot,
+        commands::model::models::openclaw_official_bootstrap_snapshot,
         commands::model::models::openclaw_use_provider_api_key_model,
         commands::model::models::openclaw_use_custom_openai_model,
         commands::model::models::openclaw_use_uniopc_official_model,

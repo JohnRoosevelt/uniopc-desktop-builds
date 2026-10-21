@@ -6,7 +6,7 @@ mod types;
 pub(crate) use self::models::implementation::openclaw_ready_model_refs_for_profile;
 pub use self::models::{
     openclaw_login_minimax_oauth, openclaw_login_openai_codex, openclaw_media_capabilities_save,
-    openclaw_models_snapshot, openclaw_use_custom_openai_model, openclaw_use_openai_api_model,
+    openclaw_models_snapshot, openclaw_official_bootstrap_snapshot, openclaw_use_custom_openai_model, openclaw_use_openai_api_model,
     openclaw_use_provider_api_key_model, openclaw_use_uniopc_official_model,
 };
 pub(crate) use self::profiles::openclaw_profile_provision;
@@ -5320,6 +5320,70 @@ fn official_model_target_preserving_existing_selection(
         .unwrap_or_else(|| requested_model.to_string())
 }
 
+// Match JS truthiness before trimming, including whitespace resolved defaults.
+fn official_bootstrap_requires_cli_auth(snapshot: &OpenClawModelsSnapshot) -> bool {
+    let model = snapshot
+        .resolved_default_model
+        .as_deref()
+        .filter(|model| !model.is_empty())
+        .or(snapshot.primary_model.as_deref())
+        .unwrap_or_default()
+        .trim();
+    !model.is_empty() && model.contains('/') && !model.starts_with("uniopc-official/")
+}
+
+async fn official_bootstrap_snapshot_with_auth<F, Fut>(
+    config: &Value,
+    models: &Value,
+    auth: &Value,
+    local_snapshot: OpenClawModelsSnapshot,
+    load_auth: F,
+) -> OpenClawModelsSnapshot
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Value>,
+{
+    if official_bootstrap_requires_cli_auth(&local_snapshot) {
+        let agent_auth = load_auth().await;
+        openclaw_models_snapshot_from_gateway_payloads_with_agent_auth(
+            config,
+            models,
+            auth,
+            Some(&agent_auth),
+        )
+    } else {
+        local_snapshot
+    }
+}
+
+async fn official_agent_migration_ready_models<F, Fut>(
+    agents: &[Value],
+    target_model: &str,
+    load_ready: F,
+) -> Result<BTreeSet<String>, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<BTreeSet<String>, String>>,
+{
+    // The legacy parser supplies all exclusions and alias handling. Empty model
+    // candidates still migrate, without needing provider availability discovery.
+    let needs_ready = agents.iter().any(|agent| {
+        !agent_model_migration_targets(std::slice::from_ref(agent), &BTreeSet::new(), target_model)
+            .is_empty()
+            && json_string_at(agent, &["model"])
+                .or_else(|| json_string_at(agent, &["defaultModel"]))
+                .or_else(|| json_string_at(agent, &["default_model"]))
+                .is_some_and(|model| !model.trim().is_empty())
+    });
+    let mut ready = if needs_ready {
+        load_ready().await?
+    } else {
+        BTreeSet::new()
+    };
+    ready.insert(target_model.to_string());
+    Ok(ready)
+}
+
 fn agent_model_migration_targets(
     agents: &[Value],
     ready_models: &BTreeSet<String>,
@@ -5395,13 +5459,21 @@ async fn openclaw_agent_auth_store_for_profile_from_cli(
     parse_json_value_from_output(&output)
 }
 
+fn openclaw_agent_auth_with_local_fallback(
+    cli_auth: Option<Value>,
+    local_auth: impl FnOnce() -> Value,
+) -> Value {
+    cli_auth.unwrap_or_else(local_auth)
+}
+
 async fn openclaw_agent_auth_store_for_profile_with_cli(
     app: &AppHandle,
     profile: Option<&str>,
 ) -> Value {
-    openclaw_agent_auth_store_for_profile_from_cli(app, profile)
-        .await
-        .unwrap_or_else(|| openclaw_agent_auth_store_for_profile(profile))
+    openclaw_agent_auth_with_local_fallback(
+        openclaw_agent_auth_store_for_profile_from_cli(app, profile).await,
+        || openclaw_agent_auth_store_for_profile(profile),
+    )
 }
 
 async fn openclaw_model_status_from_gateway_for_profile_with_cli_auth(
@@ -9366,6 +9438,171 @@ mod tests {
             patch.pointer("/models/providers/bailian-token-plan/models/0/input"),
             Some(&serde_json::json!(["text", "image"]))
         );
+    }
+
+    #[tokio::test]
+    async fn official_bootstrap_snapshot_selects_auth_from_final_default() {
+        use std::cell::Cell;
+        let auth = serde_json::json!({});
+        for model in [
+            None,
+            Some(""),
+            Some("  "),
+            Some("raw"),
+            Some("uniopc-official/test"),
+            Some("openai-codex/test"),
+            Some("custom-test/test"),
+        ] {
+            for catalog_ref in [None, Some("openai-codex/fallback")] {
+                let config = model
+                    .map(
+                        |model| serde_json::json!({"agents":{"defaults":{"model":{"primary": model}}}}),
+                    )
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let models = catalog_ref
+                    .map(|id| serde_json::json!({"models":[{"id":id}]}))
+                    .unwrap_or_else(|| serde_json::json!({"models":[]}));
+                let local = openclaw_models_snapshot_from_gateway_payloads_with_agent_auth(
+                    &config,
+                    &models,
+                    &auth,
+                    Some(&auth),
+                );
+                // Same final resolution and truthiness as JS, after builder fallback.
+                let final_ref = local
+                    .resolved_default_model
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .or(local.primary_model.as_deref())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let expected_cli = !final_ref.is_empty()
+                    && final_ref.contains('/')
+                    && !final_ref.starts_with("uniopc-official/");
+                let calls = Cell::new(0);
+                let cli_auth = serde_json::json!({"profiles":{"codex":{"provider":"openai-codex","type":"oauth","access":"test"}}});
+                let actual =
+                    official_bootstrap_snapshot_with_auth(&config, &models, &auth, local, || async {
+                        calls.set(calls.get() + 1);
+                        cli_auth.clone()
+                    })
+                    .await;
+                assert_eq!(
+                    calls.get(),
+                    usize::from(expected_cli),
+                    "{model:?} {catalog_ref:?}"
+                );
+                if expected_cli {
+                    let old = openclaw_models_snapshot_from_gateway_payloads_with_agent_auth(
+                        &config,
+                        &models,
+                        &auth,
+                        Some(&cli_auth),
+                    );
+                    assert_eq!(
+                        serde_json::to_value(actual).unwrap(),
+                        serde_json::to_value(old).unwrap()
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn official_snapshot_cli_failure_retains_profile_local_fallback() {
+        use std::cell::Cell;
+        let config =
+            serde_json::json!({"agents":{"defaults":{"model":{"primary":"openai-codex/test"}}}});
+        let models = serde_json::json!({"models":[{"id":"openai-codex/test"}]});
+        let gateway_auth = serde_json::json!({});
+        for profile_label in ["profile-a", "profile-b"] {
+            let local_auth = serde_json::json!({"profiles":{profile_label:{"provider":"openai-codex","type":"oauth","access":"test"}}});
+            for cli_result in [
+                None,
+                Some(
+                    serde_json::json!({"profiles":{"cli":{"provider":"openai-codex","type":"oauth","access":"test"}}}),
+                ),
+            ] {
+                let calls = Cell::new(0);
+                let old_auth =
+                    openclaw_agent_auth_with_local_fallback(cli_result.clone(), || local_auth.clone());
+                let old_snapshot = openclaw_models_snapshot_from_gateway_payloads_with_agent_auth(
+                    &config,
+                    &models,
+                    &gateway_auth,
+                    Some(&old_auth),
+                );
+                let local_snapshot = openclaw_models_snapshot_from_gateway_payloads_with_agent_auth(
+                    &config,
+                    &models,
+                    &gateway_auth,
+                    Some(&local_auth),
+                );
+                let actual = official_bootstrap_snapshot_with_auth(
+                    &config,
+                    &models,
+                    &gateway_auth,
+                    local_snapshot,
+                    || async {
+                        calls.set(calls.get() + 1);
+                        openclaw_agent_auth_with_local_fallback(cli_result, || local_auth.clone())
+                    },
+                )
+                .await;
+                assert_eq!(calls.get(), 1);
+                assert_eq!(
+                    serde_json::to_value(actual).unwrap(),
+                    serde_json::to_value(old_snapshot).unwrap()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn official_agent_migration_loads_auth_only_for_other_model_candidates() {
+        use std::cell::Cell;
+        let target = "uniopc-official/test";
+        for agents in [
+            serde_json::json!([]),
+            serde_json::json!([{"id":"default","isDefault":true,"model":"openai-codex/test"}]),
+            serde_json::json!([{"id":"a","model":target}]),
+            serde_json::json!([{"id":"missing"},{"agentId":"blank","default_model":"  "}]),
+            serde_json::json!([{"id":"a","model":"openai-codex/test"},{"id":"b","defaultModel":"custom-test/test"},{"id":"c","default_model":"unavailable/test"},{"id":"missing"}]),
+        ] {
+            let agents = agents.as_array().unwrap();
+            let calls = Cell::new(0);
+            let ready = official_agent_migration_ready_models(agents, target, || async {
+                calls.set(calls.get() + 1);
+                Ok([
+                    "openai-codex/test".to_string(),
+                    "custom-test/test".to_string(),
+                ]
+                .into_iter()
+                .collect())
+            })
+            .await
+            .unwrap();
+            let targets = agent_model_migration_targets(agents, &ready, target);
+            if agents.len() == 4 {
+                assert_eq!(calls.get(), 1);
+                assert_eq!(targets, vec!["c", "missing"]);
+            } else {
+                assert_eq!(calls.get(), 0);
+                if agents.len() == 2 {
+                    assert_eq!(targets, vec!["missing", "blank"]);
+                } else {
+                    assert!(targets.is_empty());
+                }
+            }
+        }
+        let agents = vec![serde_json::json!({"id":"a","model":"other/test"})];
+        let error = official_agent_migration_ready_models(&agents, target, || async {
+            Err("rpc failed".to_string())
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error, "rpc failed");
     }
 
     #[test]
