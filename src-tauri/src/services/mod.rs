@@ -2,6 +2,7 @@ pub mod artifact_index;
 pub mod browser_egress;
 pub mod browser_egress_tunnel;
 pub mod gateway_dns;
+pub mod gateway_startup_progress;
 pub mod engine_startup_metrics;
 pub mod lan_address;
 pub mod local_documents;

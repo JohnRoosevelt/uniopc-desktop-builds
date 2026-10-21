@@ -54,7 +54,39 @@ impl crate::services::startup_readiness::GatewayStartup for LocalStartupBackend<
         let config = self.config();
         let root = openclaw_gateway::load_openclaw_config_for_profile(Some(&config.profile))?;
         let resolved = resolve_effective_connection_endpoint(&config, Some(&root), None)?;
-        openclaw_gateway::http_ready_for_endpoint(&resolved.endpoint).await
+        let progress = self
+            .app
+            .state::<model::GatewaySupervisor>()
+            .startup_http_observer(&config.profile, self.generation)
+            .await;
+        openclaw_gateway::http_ready_for_endpoint_observed(&resolved.endpoint, move || {
+            if let Some(progress) = progress {
+                progress.lock().unwrap_or_else(|e| e.into_inner()).responded = true;
+            }
+        })
+        .await
+    }
+    async fn recover_stalled(&self, deadline: tokio::time::Instant) -> Result<bool, String> {
+        self.flight.checkpoint()?;
+        local_gateway_lifecycle().check(self.generation)?;
+        self.app
+            .state::<model::GatewaySupervisor>()
+            .recover_stalled_startup(&self.config().profile, self.generation, deadline, || {
+                self.flight.checkpoint()?;
+                local_gateway_lifecycle().check(self.generation)
+            })
+            .await
+    }
+    async fn finalized(&self) -> Result<(), String> {
+        self.flight.checkpoint()?;
+        local_gateway_lifecycle().check(self.generation)?;
+        self.app
+            .state::<model::GatewaySupervisor>()
+            .startup_finalized(&self.config().profile, self.generation, || {
+                self.flight.checkpoint()?;
+                local_gateway_lifecycle().check(self.generation)
+            })
+            .await
     }
     async fn auth_ready(&self) -> Result<Option<Self::Snapshot>, String> {
         let config = self.config();
@@ -125,6 +157,7 @@ impl crate::services::startup_readiness::GatewayStartup for LocalStartupBackend<
         );
     }
 }
+
 impl crate::services::startup_readiness::GatewayActivation for LocalStartupBackend<'_> {
     async fn stop_and_reclaim(&self) -> Result<(), String> {
         use crate::services::startup_readiness::GatewayStartup;
@@ -1201,9 +1234,20 @@ async fn openclaw_connection_start_local_for_profile(
     let supervisor = app.state::<model::GatewaySupervisor>();
     let running_profile = supervisor.running_profile().await;
     let running = supervisor.is_running().await;
-    let engine_matches_profile =
+    let running_runtime = supervisor.running_runtime_id_if_active().await;
+    let mut engine_matches_profile =
         owned_engine_matches_profile(&profile, running_profile.as_deref(), running)
-            && supervisor.running_runtime_matches_active().await;
+            && running_runtime.is_some();
+    if engine_matches_profile {
+        let runtime = running_runtime.as_deref().expect("verified held runtime");
+        engine_matches_profile = supervisor.bind_startup_flight(&profile, runtime, generation, || {
+            ensure_current()?;
+            if crate::services::openclaw_bundled_runtime::current_runtime_version().as_deref() != Some(runtime) {
+                return Err("gateway_startup_identity_changed".into());
+            }
+            Ok(())
+        }).await?;
+    }
     ensure_current()?;
     metrics.cold_start = !engine_matches_profile;
     metrics.preflight_ms = elapsed_ms(preflight_started_at);

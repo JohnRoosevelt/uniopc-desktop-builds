@@ -1576,6 +1576,8 @@ pub struct GatewaySupervisor {
     // Fast-death circuit-breaker state. A std mutex held only for synchronous
     // read/update (never across an `.await`), so it can't deadlock with `child`.
     respawn: std::sync::Mutex<RespawnTracker>,
+    startup_allowance: std::sync::Mutex<crate::services::gateway_startup_progress::Allowance>,
+    recovery_blocked: std::sync::atomic::AtomicBool,
 }
 
 struct GatewayChild {
@@ -1592,6 +1594,13 @@ struct GatewayChild {
     // When this child was spawned — how the breaker tells a fast death (crash
     // right after spawn) from a healthy engine that later exited.
     spawned_at: Instant,
+    identity: u64,
+    generation: u64,
+    progress: std::sync::Arc<std::sync::Mutex<crate::services::gateway_startup_progress::Progress>>,
+    #[cfg(windows)]
+    launch: FrozenGatewayLaunch,
+    #[cfg(windows)]
+    job: std::os::windows::io::OwnedHandle,
 }
 
 fn gateway_runtime_matches_active(active_runtime_id: Option<&str>, child_runtime_id: &str) -> bool {
@@ -1681,6 +1690,211 @@ async fn stop_owned_unix_gateway_process(
 }
 
 impl GatewaySupervisor {
+    /// A coordinator generation identifies a flight, not a process. Rebind
+    /// only the exact live profile/runtime child while holding its ownership lock.
+    pub async fn bind_startup_flight(
+        &self,
+        profile: &str,
+        runtime: &str,
+        generation: u64,
+        check: impl Fn() -> Result<(), String> + Send + Sync,
+    ) -> Result<bool, String> {
+        check()?;
+        let mut guard = self.child.lock().await;
+        check()?;
+        let Some(child) = guard.as_mut() else {
+            return Ok(false);
+        };
+        if child.profile.as_deref() != Some(profile)
+            || child.runtime_id != runtime
+            || generation < child.generation
+        {
+            return Err("gateway_startup_identity_changed".into());
+        }
+        if !matches!(child.process.try_wait(), Ok(None)) {
+            return Ok(false);
+        }
+        let mut allowance = self
+            .startup_allowance
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        check()?;
+        child.generation = generation;
+        allowance.enter_episode(Some(profile), runtime);
+        Ok(true)
+    }
+
+    pub async fn startup_http_observer(
+        &self,
+        profile: &str,
+        generation: u64,
+    ) -> Option<std::sync::Arc<std::sync::Mutex<crate::services::gateway_startup_progress::Progress>>>
+    {
+        let guard = self.child.lock().await;
+        guard
+            .as_ref()
+            .filter(|c| c.profile.as_deref() == Some(profile) && c.generation == generation)
+            .map(|c| c.progress.clone())
+    }
+
+    pub async fn startup_finalized(
+        &self,
+        profile: &str,
+        generation: u64,
+        check: impl Fn() -> Result<(), String> + Send + Sync,
+    ) -> Result<(), String> {
+        check()?;
+        let mut guard = self.child.lock().await;
+        check()?;
+        let child = guard
+            .as_mut()
+            .filter(|c| c.profile.as_deref() == Some(profile) && c.generation == generation)
+            .ok_or("gateway_startup_identity_changed")?;
+        if !matches!(child.process.try_wait(), Ok(None)) {
+            return Err("gateway_owned_child_exited".into());
+        }
+        // No await may separate this final cancellation/generation check from
+        // anchoring/resetting the episode allowance.
+        let mut allowance = self
+            .startup_allowance
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        check()?;
+        allowance.finalized(child.identity, Instant::now());
+        Ok(())
+    }
+
+    /// Recovery never calls ensure_running: that path reclaims orphans and
+    /// prepares mutable config. All validation and allowance consumption occur
+    /// under the sole child lock; uncertainty keeps the dead child held.
+    pub async fn recover_stalled_startup(
+        &self,
+        profile: &str,
+        generation: u64,
+        deadline: tokio::time::Instant,
+        check: impl Fn() -> Result<(), String> + Send + Sync,
+    ) -> Result<bool, String> {
+        #[cfg(not(windows))]
+        {
+            let _ = (profile, generation, deadline, check);
+            Ok(false)
+        }
+        #[cfg(windows)]
+        {
+            check()?;
+            if self
+                .recovery_blocked
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err("gateway_startup_termination_unconfirmed".into());
+            }
+            crate::commands::openclaw_connection::ensure_local_gateway_generation(generation)?;
+            if crate::services::uniopc_runtime_paths::read_active_profile_key().as_deref()
+                != Some(profile)
+            {
+                return Err("gateway_startup_identity_changed".into());
+            }
+            let mut guard = self.child.lock().await;
+            let Some(child) = guard.as_mut() else {
+                return Ok(false);
+            };
+            if child.profile.as_deref() != Some(profile)
+                || child.generation != generation
+                || crate::services::openclaw_bundled_runtime::current_runtime_version().as_deref()
+                    != Some(child.runtime_id.as_str())
+            {
+                return Err("gateway_startup_identity_changed".into());
+            }
+            if !matches!(child.process.try_wait(), Ok(None)) {
+                return Ok(false);
+            }
+            if !child
+                .progress
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .eligible(
+                    Instant::now(),
+                    deadline.saturating_duration_since(tokio::time::Instant::now()),
+                )
+            {
+                return Ok(false);
+            }
+            child.launch.verify_config()?;
+            {
+                // Serialize the final eligibility decision with header/listen
+                // latches until the synchronous termination request is sent.
+                let progress = child.progress.lock().unwrap_or_else(|e| e.into_inner());
+                if !progress.eligible(
+                    Instant::now(),
+                    deadline.saturating_duration_since(tokio::time::Instant::now()),
+                ) {
+                    return Ok(false);
+                }
+                check()?;
+                if !self
+                    .startup_allowance
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .consume()
+                {
+                    return Ok(false);
+                }
+                // Cancellation or uncertainty stays closed across later flights.
+                self.recovery_blocked
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                crate::services::owned_command::request_job_termination(&child.job)
+                    .map_err(|_| "gateway_startup_termination_unconfirmed")?;
+            }
+            let launch = child.launch.clone();
+            let runtime = child.runtime_id.clone();
+            let identity = self.spawn_count() + 1;
+            crate::services::owned_command::confirm_job_termination(&child.job, &mut child.process)
+                .await
+                .map_err(|_| "gateway_startup_termination_unconfirmed")?;
+            check()?;
+            crate::commands::openclaw_connection::ensure_local_gateway_generation(generation)?;
+            if crate::services::uniopc_runtime_paths::read_active_profile_key().as_deref()
+                != Some(profile)
+            {
+                return Err("gateway_startup_identity_changed".into());
+            }
+            if crate::services::openclaw_bundled_runtime::current_runtime_version().as_deref()
+                != Some(runtime.as_str())
+            {
+                return Err("gateway_startup_identity_changed".into());
+            }
+            let replacement = launch
+                .spawn(Some(profile.to_owned()), runtime, generation, identity)
+                .await?;
+            check()?;
+            crate::commands::openclaw_connection::ensure_local_gateway_generation(generation)?;
+            if crate::services::uniopc_runtime_paths::read_active_profile_key().as_deref()
+                != Some(profile)
+            {
+                return Err("gateway_startup_identity_changed".into());
+            }
+            if crate::services::openclaw_bundled_runtime::current_runtime_version().as_deref()
+                != Some(replacement.runtime_id.as_str())
+            {
+                return Err("gateway_startup_identity_changed".into());
+            }
+            if let Some(pid) = replacement.process.id() {
+                crate::services::openclaw_connection::write_gateway_endpoint_record(
+                    None,
+                    launch.port,
+                    pid,
+                    generation,
+                    gateway_process_creation_time(pid),
+                );
+            }
+            *guard = Some(replacement);
+            self.spawn_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.recovery_blocked
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            Ok(true)
+        }
+    }
     pub fn spawn_count(&self) -> u64 {
         self.spawn_count.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -1689,6 +1903,9 @@ impl GatewaySupervisor {
     /// is still alive, no-op; if it exited, respawn. Clears any stray gateway on
     /// our port (from a previously crashed app) before spawning.
     pub async fn ensure_running(&self) -> Result<(), String> {
+        if self.recovery_blocked.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("gateway_startup_termination_unconfirmed".into());
+        }
         let active_runtime_id = crate::services::openclaw_bundled_runtime::current_runtime_version()
             .ok_or_else(|| "OpenClaw 8.1 运行时未验证。".to_string())?;
         require_verified_openclaw_runtime(true)?;
@@ -1748,7 +1965,8 @@ impl GatewaySupervisor {
         reclaim_orphan_engines_before_start()?;
         let port = crate::services::openclaw_connection::pick_local_gateway_port();
         let active_profile = crate::services::uniopc_runtime_paths::read_active_profile_key();
-        let mut child = match spawn_local_gateway_child(port, active_profile.as_deref()) {
+        self.startup_allowance.lock().unwrap_or_else(|e| e.into_inner()).enter_episode(active_profile.as_deref(), &active_runtime_id);
+        let mut child = match spawn_local_gateway_child(port, active_profile.as_deref()).await {
             Ok(child) => child,
             Err(error) => {
                 // A spawn that can't even exec is itself a fast death — count it so
@@ -1761,14 +1979,14 @@ impl GatewaySupervisor {
         if crate::services::openclaw_bundled_runtime::current_runtime_version().as_deref()
             != Some(active_runtime_id.as_str())
         {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
+            let _ = child.process.start_kill();
+            let _ = child.process.wait().await;
             return Err("引擎运行时在 Gateway 启动期间发生变化，请重试。".to_string());
         }
         // Publish the bound port (every local resolver reads it) and record it +
         // the child pid so the next launch can reclaim this engine if we crash.
         crate::services::openclaw_connection::set_local_gateway_port(port);
-        if let Some(pid) = child.id() {
+        if let Some(pid) = child.process.id() {
             crate::services::openclaw_connection::write_gateway_endpoint_record(
                 None,
                 port,
@@ -1777,12 +1995,8 @@ impl GatewaySupervisor {
                 gateway_process_creation_time(pid),
             );
         }
-        *guard = Some(GatewayChild {
-            process: child,
-            profile: active_profile,
-            runtime_id: active_runtime_id,
-            spawned_at: now,
-        });
+        child.identity = self.spawn_count() + 1;
+        *guard = Some(child);
         self.spawn_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
@@ -1863,23 +2077,13 @@ impl GatewaySupervisor {
             tracker.last_attempt_at = None;
         }
         let mut guard = self.child.lock().await;
+        self.startup_allowance.lock().unwrap_or_else(|e| e.into_inner()).detached();
         if let Some(mut child) = guard.take() {
             #[cfg(unix)]
             let _ = stop_owned_unix_gateway_process(&mut child.process, GATEWAY_STOP_GRACE).await;
             #[cfg(windows)]
-            if let Some(pid) = child.process.id() {
-                // The Windows entrypoint is `openclaw.cmd`, which launches the
-                // real Node gateway as its child. Killing only the tracked cmd
-                // wrapper leaves Node bound to the port with the previous
-                // per-run password, so the next app launch sees an auth-token
-                // mismatch. `/T` terminates that complete process tree.
-                let pid = pid.to_string();
-                let mut command = std::process::Command::new("taskkill");
-                command.args(["/PID", &pid, "/T", "/F"]);
-                crate::services::openclaw_cli::hide_console(&mut command);
-                let _ = command.output();
-            }
-            #[cfg(not(unix))]
+            let _ = crate::services::owned_command::terminate_job(&child.job, &mut child.process).await;
+            #[cfg(not(any(unix, windows)))]
             {
                 let _ = child.process.start_kill();
                 let _ = child.process.wait().await;
@@ -2037,27 +2241,82 @@ fn prepare_gateway_log(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn forward_sanitized_gateway_output<R>(mut reader: R, path: PathBuf)
-where
+fn forward_sanitized_gateway_output<R>(
+    mut reader: R,
+    path: Option<PathBuf>,
+    progress: std::sync::Arc<std::sync::Mutex<crate::services::gateway_startup_progress::Progress>>,
+) where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
+    // Disk logging cannot delay milestone consumption or block the engine's
+    // pipes. Bounded best-effort log delivery drops excess output under load.
+    let (logs, mut pending) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
     tokio::spawn(async move {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-        let Ok(mut output) = tokio::fs::OpenOptions::new().create(true).append(true).open(path).await else { return };
-        let mut reader = tokio::io::BufReader::new(&mut reader);
+        use tokio::io::AsyncWriteExt;
+        let Some(path) = path else { return };
+        let Ok(mut output) = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .await
+        else {
+            return;
+        };
         let mut line = Vec::new();
-        loop {
-            line.clear();
-            match reader.read_until(b'\n', &mut line).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {
+        while let Some(chunk) = pending.recv().await {
+            for byte in chunk {
+                if line.len() < 65536 {
+                    line.push(byte);
+                }
+                if byte == b'\n' {
                     let text = String::from_utf8_lossy(&line);
                     let branded = crate::services::white_label::sanitize_runtime_text(&text);
-                    if output.write_all(branded.as_bytes()).await.is_err() { break; }
+                    if output.write_all(branded.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    line.clear();
                 }
             }
         }
+        let text = String::from_utf8_lossy(&line);
+        let branded = crate::services::white_label::sanitize_runtime_text(&text);
+        let _ = output.write_all(branded.as_bytes()).await;
         let _ = output.flush().await;
+    });
+    tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut chunk = [0u8; 4096];
+        let mut line = Vec::with_capacity(192);
+        let mut oversized = false;
+        loop {
+            let count = match reader.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            for byte in &chunk[..count] {
+                if *byte == b'\n' {
+                    if !oversized {
+                        if let Some(event) = crate::services::gateway_startup_progress::parse(&line)
+                        {
+                            progress
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .observe(event, Instant::now());
+                        }
+                    }
+                    line.clear();
+                    oversized = false;
+                } else if !oversized {
+                    if line.len() < 192 {
+                        line.push(*byte);
+                    } else {
+                        line.clear();
+                        oversized = true;
+                    }
+                }
+            }
+            let _ = logs.try_send(chunk[..count].to_vec());
+        }
     });
 }
 
@@ -2070,10 +2329,202 @@ pub struct GatewayLogTail {
     pub exists: bool,
 }
 
-fn spawn_local_gateway_child(
+fn capture_gateway_environment(
+    source: &std::process::Command,
+    inherited: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> BTreeMap<std::ffi::OsString, std::ffi::OsString> {
+    // std::process::Command uses Windows' case-insensitive environment keys.
+    // Let it merge inherited Path and explicit PATH before freezing the result.
+    let mut merged = std::process::Command::new(source.get_program());
+    merged.env_clear().envs(inherited);
+    for (key, value) in source.get_envs() {
+        match value {
+            Some(value) => {
+                merged.env(key, value);
+            }
+            None => {
+                merged.env_remove(key);
+            }
+        }
+    }
+    #[cfg(windows)]
+    merged.env_remove("NODE_OPTIONS");
+    merged
+        .get_envs()
+        .filter_map(|(key, value)| value.map(|value| (key.to_owned(), value.to_owned())))
+        .collect()
+}
+
+/// Everything used for a replacement is captured before the first spawn.
+/// In particular, spawn() performs no profile/config/plugin preparation.
+#[derive(Clone)]
+struct FrozenGatewayLaunch {
+    program: std::ffi::OsString,
+    args: Vec<std::ffi::OsString>,
+    env: BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+    directory: Option<PathBuf>,
+    log_path: Option<PathBuf>,
+    port: u16,
+    #[cfg(windows)]
+    config_identity: Option<crate::services::gateway_startup_progress::ConfigIdentity>,
+}
+impl FrozenGatewayLaunch {
+    fn capture(
+        command: tokio::process::Command,
+        log_path: Option<PathBuf>,
+        port: u16,
+    ) -> Result<Self, String> {
+        let command = command.as_std();
+        let env = capture_gateway_environment(command, std::env::vars_os());
+        #[allow(unused_mut)]
+        let mut result = Self {
+            program: command.get_program().to_owned(),
+            args: command.get_args().map(|a| a.to_owned()).collect(),
+            env,
+            directory: command.get_current_dir().map(Path::to_path_buf),
+            log_path,
+            port,
+            #[cfg(windows)]
+            config_identity: None,
+        };
+        #[cfg(windows)]
+        {
+            // Environment keys are case insensitive on Windows.
+            result
+                .env
+                .retain(|key, _| !key.to_string_lossy().eq_ignore_ascii_case("NODE_OPTIONS"));
+            let node =
+                fs::canonicalize(&result.program).map_err(|_| "gateway_startup_node_unverified")?;
+            let allowed = [
+                crate::services::uniopc_runtime_paths::runtime_bin_dir()?,
+                crate::services::uniopc_runtime_paths::runtime_tools_dir()?.join("node"),
+                crate::services::uniopc_runtime_paths::runtime_node_bin_dir()?,
+            ];
+            if !allowed
+                .iter()
+                .any(|dir| fs::canonicalize(dir.join("node.exe")).ok().as_ref() == Some(&node))
+            {
+                return Err("gateway_startup_node_unverified".into());
+            }
+            // DNS is the only permitted prior preload; both paths must be
+            // existing exact app-owned files, never a same-name foreign file.
+            let expected_dns = fs::canonicalize(
+                crate::services::uniopc_runtime_paths::uniopc_data_dir()?
+                    .join("network/gateway-dns.cjs"),
+            )
+            .map_err(|_| "gateway_startup_launch_shape_invalid")?;
+            let expected_entry = fs::canonicalize(
+                Path::new(&result.program)
+                    .parent()
+                    .ok_or("gateway_startup_launch_shape_invalid")?
+                    .join("node_modules/uniopc-engine/uniopc-engine.mjs"),
+            )
+            .map_err(|_| "gateway_startup_launch_shape_invalid")?;
+            if result.args.len() != 9
+                || result.args[0] != "--require"
+                || fs::canonicalize(&result.args[1]).ok().as_ref() != Some(&expected_dns)
+                || fs::canonicalize(&result.args[2]).ok().as_ref() != Some(&expected_entry)
+                || result.args[3] != "gateway"
+                || result.args[4] != "run"
+                || result.args[5] != "--port"
+                || result.args[6] != port.to_string().as_str()
+                || result.args[7] != "--auth"
+                || result.args[8] != "password"
+            {
+                return Err("gateway_startup_launch_shape_invalid".into());
+            }
+            let path = crate::services::uniopc_runtime_paths::uniopc_data_dir()?
+                .join("network/gateway-startup.cjs");
+            fs::write(
+                &path,
+                include_str!("../../services/gateway_startup_progress.cjs"),
+            )
+            .map_err(|_| "gateway_startup_preload_write_failed")?;
+            result.args.splice(
+                0..0,
+                [std::ffi::OsString::from("--require"), path.into_os_string()],
+            );
+        }
+        Ok(result)
+    }
+    #[cfg(windows)]
+    fn verify_config(&self) -> Result<(), String> {
+        self.config_identity
+            .as_ref()
+            .ok_or("gateway_startup_config_changed")?
+            .verify()
+    }
+    async fn spawn(
+        &self,
+        profile: Option<String>,
+        runtime_id: String,
+        generation: u64,
+        identity: u64,
+    ) -> Result<GatewayChild, String> {
+        #[cfg(windows)]
+        if self.config_identity.is_some() {
+            self.verify_config()?;
+        }
+        let mut command = tokio::process::Command::new(&self.program);
+        command
+            .args(&self.args)
+            .env_clear()
+            .envs(&self.env)
+            .kill_on_drop(true)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        #[cfg(windows)]
+        command.env_remove("NODE_OPTIONS");
+        if let Some(directory) = &self.directory {
+            command.current_dir(directory);
+        }
+        #[cfg(windows)]
+        command.stdin(std::process::Stdio::piped());
+        #[cfg(not(windows))]
+        command.stdin(std::process::Stdio::null());
+        #[cfg(unix)]
+        command.process_group(0);
+        crate::services::openclaw_cli::hide_console_tokio(&mut command);
+        let mut process = command
+            .spawn()
+            .map_err(|_| "gateway_startup_spawn_failed")?;
+        #[cfg(windows)]
+        let job = crate::services::owned_command::gate_gateway_child(
+            &mut process,
+            crate::services::owned_command::process_job,
+        )
+        .await
+        .map_err(|_| "gateway_startup_containment_failed")?;
+        let spawned_at = Instant::now();
+        let progress = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::services::gateway_startup_progress::Progress::new(spawned_at, self.port),
+        ));
+        if let Some(stdout) = process.stdout.take() {
+            forward_sanitized_gateway_output(stdout, self.log_path.clone(), progress.clone());
+        }
+        if let Some(stderr) = process.stderr.take() {
+            forward_sanitized_gateway_output(stderr, self.log_path.clone(), progress.clone());
+        }
+        Ok(GatewayChild {
+            process,
+            profile,
+            runtime_id,
+            spawned_at,
+            identity,
+            generation,
+            progress,
+            #[cfg(windows)]
+            launch: self.clone(),
+            #[cfg(windows)]
+            job,
+        })
+    }
+}
+
+async fn spawn_local_gateway_child(
     port: u16,
     profile: Option<&str>,
-) -> Result<tokio::process::Child, String> {
+) -> Result<GatewayChild, String> {
     if let Some(profile) = profile {
         crate::commands::openclaw_connection::prepare_local_gateway_startup_config(profile)?;
         // OpenClaw 8.1 cannot replay assistant-side non-text media blocks:
@@ -2085,6 +2536,7 @@ fn spawn_local_gateway_child(
             eprintln!("[openclaw] could not repair legacy assistant attachments: {error}");
         }
     }
+    let expected_port = port;
     let port = port.to_string();
     let gateway_args: Vec<String> = vec![
         "gateway".to_string(),
@@ -2130,28 +2582,16 @@ fn spawn_local_gateway_child(
     // Capture the child's stdout/stderr to a rotating per-profile log so a boot
     // failure is diagnosable instead of discarded (see `gateway_log_stdio`).
     let log_path = gateway_log_path(profile).ok().filter(|path| prepare_gateway_log(path).is_ok());
-    command.stdin(std::process::Stdio::null());
-    if log_path.is_some() {
-        command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
-    } else {
-        command.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
-    }
-    // Own the whole process tree: the gateway (Node) spawns its own children;
-    // a new process group lets `stop()`/quit tear all of them down together
-    // instead of orphaning port-holders (the `kill_stray_gateway_on_port` sweep
-    // is then only a crash-recovery backstop).
-    #[cfg(unix)]
-    command.process_group(0);
-    // Windows: never pop up a console window for the Node gateway subprocess.
-    crate::services::openclaw_cli::hide_console_tokio(&mut command);
-    let mut child = command
-        .spawn()
-        .map_err(|e| format!("启动 Uniopc 引擎 gateway 子进程失败: {e}"))?;
-    if let Some(path) = log_path {
-        if let Some(stdout) = child.stdout.take() { forward_sanitized_gateway_output(stdout, path.clone()); }
-        if let Some(stderr) = child.stderr.take() { forward_sanitized_gateway_output(stderr, path); }
-    }
-    Ok(child)
+    #[allow(unused_mut)]
+    let mut launch = FrozenGatewayLaunch::capture(command, log_path, expected_port)?;
+    #[cfg(windows)]
+    { launch.config_identity = Some(crate::services::gateway_startup_progress::ConfigIdentity::capture(
+        openclaw_gateway::openclaw_config_path_for_profile(profile)?
+    )?); }
+    let runtime_id = crate::services::openclaw_bundled_runtime::current_runtime_version()
+        .ok_or("gateway_startup_runtime_unverified")?;
+    launch.spawn(profile.map(str::to_string), runtime_id, crate::commands::openclaw_connection::local_gateway_generation(), 0).await
+
 }
 
 // Reclaim (kill) engines THIS app started for any profile in a previous
@@ -7434,6 +7874,163 @@ mod tests {
     }
 
     #[cfg(unix)]
+    async fn held_startup_fixture() -> GatewayChild {
+        let process = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "exec sleep 30"])
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        GatewayChild {
+            process,
+            profile: Some("fixture".into()),
+            runtime_id: "runtime".into(),
+            spawned_at: Instant::now(),
+            identity: 42,
+            generation: 1,
+            progress: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::services::gateway_startup_progress::Progress::new(Instant::now(), 1234),
+            )),
+        }
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reused_child_binds_sequential_successes_and_retry_without_resetting_progress_or_allowance(
+    ) {
+        let supervisor = GatewaySupervisor::default();
+        let child = held_startup_fixture().await;
+        let progress = child.progress.clone();
+        progress.lock().unwrap().responded = true;
+        {
+            let mut a = supervisor.startup_allowance.lock().unwrap();
+            a.enter_episode(Some("fixture"), "runtime");
+            assert!(a.consume());
+        }
+        *supervisor.child.lock().await = Some(child);
+        for generation in [1, 2, 3, 4] {
+            assert!(supervisor
+                .bind_startup_flight("fixture", "runtime", generation, || Ok(()))
+                .await
+                .unwrap());
+            // Flight 3 fails; flight 4 must still bind and fully finalize.
+            if generation != 3 {
+                supervisor
+                    .startup_finalized("fixture", generation, || Ok(()))
+                    .await
+                    .unwrap();
+            }
+            let observed = supervisor
+                .startup_http_observer("fixture", generation)
+                .await
+                .unwrap();
+            assert!(std::sync::Arc::ptr_eq(&observed, &progress));
+            assert!(observed.lock().unwrap().responded);
+            assert!(!supervisor.startup_allowance.lock().unwrap().consume());
+        }
+        supervisor.stop().await;
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_finalize_waiting_for_child_lock_neither_anchors_nor_resets_allowance() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        for already_anchored in [false, true] {
+            let supervisor = Arc::new(GatewaySupervisor::default());
+            *supervisor.child.lock().await = Some(held_startup_fixture().await);
+            {
+                let mut a = supervisor.startup_allowance.lock().unwrap();
+                a.enter_episode(Some("fixture"), "runtime");
+                assert!(a.consume());
+                if already_anchored {
+                    a.finalized(42, Instant::now() - Duration::from_secs(20));
+                }
+            }
+            let held = supervisor.child.lock().await;
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let task = {
+                let supervisor = supervisor.clone();
+                let cancelled = cancelled.clone();
+                let entered = entered.clone();
+                tokio::spawn(async move {
+                    supervisor
+                        .startup_finalized("fixture", 1, || {
+                            entered.notify_one();
+                            if cancelled.load(Ordering::SeqCst) {
+                                Err("cancelled".into())
+                            } else {
+                                Ok(())
+                            }
+                        })
+                        .await
+                })
+            };
+            entered.notified().await;
+            cancelled.store(true, Ordering::SeqCst);
+            drop(held);
+            assert_eq!(task.await.unwrap().unwrap_err(), "cancelled");
+            {
+                let mut a = supervisor.startup_allowance.lock().unwrap();
+                assert!(!a.consume());
+                if !already_anchored {
+                    a.finalized(42, Instant::now() + Duration::from_secs(16));
+                    assert!(
+                        !a.consume(),
+                        "cancelled finalization must not establish an anchor"
+                    );
+                }
+            }
+            supervisor.stop().await;
+        }
+    }
+    #[tokio::test]
+    async fn uncertain_gateway_recovery_stays_closed_across_stops_and_repeated_flights() {
+        let supervisor = GatewaySupervisor::default();
+        supervisor
+            .recovery_blocked
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..2 {
+            assert_eq!(
+                supervisor.ensure_running().await.unwrap_err(),
+                "gateway_startup_termination_unconfirmed"
+            );
+            supervisor.stop().await;
+        }
+        assert_eq!(supervisor.spawn_count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn frozen_gateway_respawn_reuses_launch_environment_without_preparation() {
+        let dir = std::env::temp_dir().join(format!("uniopc-frozen-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("launches");
+        let variable = format!("UNIOPC_FROZEN_{}", uuid::Uuid::new_v4().simple());
+        std::env::set_var(&variable, "before");
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args(["-c", "printenv \"$2\" | tr -d '\\n' >> \"$1\"", "fixture"]);
+        command.arg(&marker).arg(&variable);
+        let launch = FrozenGatewayLaunch::capture(command, None, 1234).unwrap();
+        std::env::set_var(&variable, "after");
+        for identity in [1, 2] {
+            let mut child = launch
+                .spawn(
+                    Some("fixture".into()),
+                    "fixture-runtime".into(),
+                    0,
+                    identity,
+                )
+                .await
+                .unwrap();
+            assert!(child.process.wait().await.unwrap().success());
+        }
+        std::env::remove_var(&variable);
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "beforebefore");
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[cfg(unix)]
     #[tokio::test]
     async fn gateway_stop_waits_for_term_cleanup_before_reaping() {
         use tokio::io::AsyncBufReadExt;
@@ -7458,13 +8055,16 @@ mod tests {
             .unwrap();
         assert_eq!(ready.trim(), "ready");
         let supervisor = GatewaySupervisor::default();
+        assert!(supervisor.startup_allowance.lock().unwrap().consume());
         *supervisor.child.lock().await = Some(GatewayChild {
             process,
             profile: Some("fixture".into()),
             runtime_id: "fixture-runtime".into(),
-            spawned_at: Instant::now(),
+            spawned_at: Instant::now(), identity: 1, generation: 0,
+            progress: std::sync::Arc::new(std::sync::Mutex::new(crate::services::gateway_startup_progress::Progress::new(Instant::now(), 1234))),
         });
         supervisor.stop().await;
+        assert!(!supervisor.startup_allowance.lock().unwrap().consume(), "ordinary stop must not reset the recovery allowance");
         let cleaned = fs::read_to_string(&marker);
         fs::remove_dir_all(dir).unwrap();
         assert_eq!(
@@ -7749,9 +8349,8 @@ mod tests {
         let stop = &source[stop_start..stop_end];
 
         assert!(stop.contains("#[cfg(windows)]"));
-        assert!(stop.contains("Command::new(\"taskkill\")"));
-        assert!(stop.contains("/T"));
-        assert!(stop.contains("/F"));
+        assert!(stop.contains("terminate_job(&child.job, &mut child.process)"));
+        assert!(!stop.contains("taskkill"));
     }
 
     // Loud-failure guard for the image-generation SSRF fix: the gateway child
@@ -11432,5 +12031,279 @@ mod tests {
             event.pointer("/message/openclawDelivery/mediaUrls/0"),
             Some(&serde_json::json!("/tmp/video.mp4"))
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod gateway_startup_windows_tests {
+    use super::*;
+    const FIXTURE: &str =
+        "commands::model::gateway_startup_windows_tests::contained_descendant_fixture";
+    #[test]
+    fn contained_descendant_fixture() {
+        let Ok(path) = std::env::var("UNIOPC_STARTUP_JOB_FIXTURE") else {
+            return;
+        };
+        use windows_sys::Win32::System::{
+            JobObjects::IsProcessInJob, Threading::GetCurrentProcess,
+        };
+        let mut in_job = 0;
+        assert_ne!(
+            unsafe { IsProcessInJob(GetCurrentProcess(), std::ptr::null_mut(), &mut in_job) },
+            0
+        );
+        assert_ne!(
+            in_job, 0,
+            "engine descendant ran before Job Object containment"
+        );
+        let path = PathBuf::from(path);
+        fs::write(path.with_extension("ready"), std::process::id().to_string()).unwrap();
+        for _ in 0..1500 {
+            if path.with_extension("go").exists() {
+                fs::write(&path, "descendant escaped").unwrap();
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    #[tokio::test]
+    async fn windows_gateway_job_precedes_engine_descendant_and_termination_blocks_writes() {
+        let node = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|dir| dir.join("node.exe"))
+            .find(|path| path.is_file())
+            .expect("Windows candidate CI must provide Node");
+        let dir = std::env::temp_dir().join(format!("uniopc-startup-job-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let preload = dir.join("startup.cjs");
+        fs::write(
+            &preload,
+            include_str!("../../services/gateway_startup_progress.cjs"),
+        )
+        .unwrap();
+        let hostile = dir.join("hostile.cjs");
+        let hostile_marker = dir.join("hostile-ran");
+        fs::write(
+            &hostile,
+            format!(
+                "require('node:fs').writeFileSync({},'bad')",
+                serde_json::to_string(&hostile_marker.to_string_lossy()).unwrap()
+            ),
+        )
+        .unwrap();
+        let marker = dir.join("escaped");
+        let body = dir.join("body.cjs");
+        fs::write(&body, format!("require('node:child_process').spawnSync({},['--exact',{},'--nocapture'],{{stdio:'inherit'}})", serde_json::to_string(&std::env::current_exe().unwrap().to_string_lossy()).unwrap(), serde_json::to_string(FIXTURE).unwrap())).unwrap();
+        let mut env: BTreeMap<_, _> = std::env::vars_os().collect();
+        env.insert(
+            "NODE_OPTIONS".into(),
+            format!(
+                "--require {}",
+                serde_json::to_string(&hostile.to_string_lossy()).unwrap()
+            )
+            .into(),
+        );
+        env.insert(
+            "UNIOPC_STARTUP_JOB_FIXTURE".into(),
+            marker.clone().into_os_string(),
+        );
+        let launch = FrozenGatewayLaunch {
+            program: node.into_os_string(),
+            args: vec![
+                "--require".into(),
+                preload.into_os_string(),
+                body.into_os_string(),
+            ],
+            env,
+            directory: None,
+            log_path: None,
+            port: 1234,
+            config_identity: None,
+        };
+        let mut child = launch
+            .spawn(Some("fixture".into()), "fixture".into(), 0, 1)
+            .await
+            .unwrap();
+        for _ in 0..400 {
+            if marker.with_extension("ready").exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            marker.with_extension("ready").exists(),
+            "contained grandchild did not execute"
+        );
+        assert!(
+            !hostile_marker.exists(),
+            "inherited NODE_OPTIONS ran before the gate"
+        );
+        // Check the exact held job, not merely any enclosing CI runner job.
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::{
+            Foundation::CloseHandle,
+            System::{
+                JobObjects::IsProcessInJob,
+                Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+            },
+        };
+        let pid = fs::read_to_string(marker.with_extension("ready"))
+            .unwrap()
+            .parse::<u32>()
+            .unwrap();
+        let descendant = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        assert!(!descendant.is_null());
+        let mut member = 0;
+        let queried = unsafe { IsProcessInJob(descendant, child.job.as_raw_handle(), &mut member) };
+        unsafe {
+            CloseHandle(descendant);
+        }
+        assert_ne!(queried, 0);
+        assert_ne!(
+            member, 0,
+            "grandchild was created outside the exact held job"
+        );
+        crate::services::owned_command::terminate_job(&child.job, &mut child.process)
+            .await
+            .unwrap();
+        fs::write(marker.with_extension("go"), "go").unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !marker.exists(),
+            "terminated descendant wrote after zero-member proof"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn changed_config_blocks_frozen_replacement_before_engine_execution() {
+        let node = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|dir| dir.join("node.exe"))
+            .find(|path| path.is_file())
+            .expect("Windows candidate CI must provide Node");
+        let dir =
+            std::env::temp_dir().join(format!("uniopc-frozen-config-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("config.json");
+        std::fs::write(&config, b"original").unwrap();
+        let marker = dir.join("body-ran");
+        let launch = FrozenGatewayLaunch {
+            program: node.into_os_string(),
+            args: vec![
+                "-e".into(),
+                format!(
+                    "require('node:fs').writeFileSync({},'bad')",
+                    serde_json::to_string(&marker.to_string_lossy()).unwrap()
+                )
+                .into(),
+            ],
+            env: std::env::vars_os().collect(),
+            directory: None,
+            log_path: None,
+            port: 1234,
+            config_identity: Some(
+                crate::services::gateway_startup_progress::ConfigIdentity::capture(config.clone())
+                    .unwrap(),
+            ),
+        };
+        std::fs::write(&config, b"changed").unwrap();
+        assert_eq!(
+            launch
+                .spawn(Some("fixture".into()), "runtime".into(), 1, 1)
+                .await
+                .err()
+                .unwrap(),
+            "gateway_startup_config_changed"
+        );
+        assert!(!marker.exists());
+        assert_eq!(std::fs::read(&config).unwrap(), b"changed");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn windows_frozen_environment_merges_path_and_removes_keys_case_insensitively() {
+        let mut source = std::process::Command::new("node.exe");
+        source
+            .env("PATH", "explicit-bundled-path")
+            .env_remove("rEmOvE_mE");
+        let env = capture_gateway_environment(
+            &source,
+            [
+                ("Path".into(), "inherited-path".into()),
+                ("NODE_options".into(), "hostile".into()),
+                ("REMOVE_ME".into(), "old".into()),
+            ],
+        );
+        let paths: Vec<_> = env
+            .iter()
+            .filter(|(key, _)| key.to_string_lossy().eq_ignore_ascii_case("PATH"))
+            .collect();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].1, "explicit-bundled-path");
+        assert!(!env.keys().any(
+            |key| key.to_string_lossy().eq_ignore_ascii_case("NODE_OPTIONS")
+                || key.to_string_lossy().eq_ignore_ascii_case("REMOVE_ME")
+        ));
+    }
+
+    #[tokio::test]
+    async fn windows_gateway_assignment_and_ack_failures_never_release_engine_body() {
+        let node = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|dir| dir.join("node.exe"))
+            .find(|path| path.is_file())
+            .expect("Windows candidate CI must provide Node");
+        for missing_pipe in [false, true] {
+            let dir =
+                std::env::temp_dir().join(format!("uniopc-gate-fail-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&dir).unwrap();
+            let preload = dir.join("startup.cjs");
+            fs::write(
+                &preload,
+                include_str!("../../services/gateway_startup_progress.cjs"),
+            )
+            .unwrap();
+            let marker = dir.join("body-ran");
+            let body = format!(
+                "require('node:fs').writeFileSync({},'bad')",
+                serde_json::to_string(&marker.to_string_lossy()).unwrap()
+            );
+            let mut process = tokio::process::Command::new(&node)
+                .args([
+                    std::ffi::OsStr::new("--require"),
+                    preload.as_os_str(),
+                    std::ffi::OsStr::new("-e"),
+                    std::ffi::OsStr::new(&body),
+                ])
+                .env_remove("NODE_OPTIONS")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(!marker.exists(), "engine body ran while ACK was withheld");
+            let outcome = if missing_pipe {
+                drop(process.stdin.take());
+                crate::services::owned_command::gate_gateway_child(
+                    &mut process,
+                    crate::services::owned_command::process_job,
+                )
+                .await
+            } else {
+                crate::services::owned_command::gate_gateway_child(&mut process, |_| {
+                    Err(std::io::Error::other("injected assignment failure"))
+                })
+                .await
+            };
+            assert!(outcome.is_err());
+            assert!(
+                process.id().is_none(),
+                "failed gate must reap the direct child before returning"
+            );
+            assert!(
+                !marker.exists(),
+                "failed containment released the engine body"
+            );
+            fs::remove_dir_all(dir).unwrap();
+        }
     }
 }

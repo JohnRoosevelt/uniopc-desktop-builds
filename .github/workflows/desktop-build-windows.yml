@@ -92,6 +92,11 @@ jobs:
           & $perl -MLocale::Maketext::Simple -e 'print "Perl ready\n"'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Add-Content -Path $env:GITHUB_PATH -Value 'C:\Strawberry\perl\bin'
+      - name: Test native Windows gateway startup containment
+        shell: bash
+        run: |
+          export PATH="/c/Strawberry/perl/bin:$PATH"
+          cargo test --locked --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc --lib commands::model::gateway_startup_windows_tests -- --nocapture
       - name: Build and sign Windows updater from verified runtime snapshot
         shell: bash
         env:

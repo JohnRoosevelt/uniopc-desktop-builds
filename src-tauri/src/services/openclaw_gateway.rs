@@ -535,12 +535,18 @@ pub async fn http_ready(profile: Option<&str>) -> Result<bool, String> {
 }
 
 pub async fn http_ready_for_endpoint(endpoint: &GatewayEndpoint) -> Result<bool, String> {
+    http_ready_for_endpoint_observed(endpoint, || {}).await
+}
+
+/// Runs at response headers, before status/schema/body processing.
+pub async fn http_ready_for_endpoint_observed(endpoint: &GatewayEndpoint, observed: impl FnOnce()) -> Result<bool, String> {
     let url = format!("{}/readyz", http_base_from_ws_url(&endpoint.url));
     let response = readiness_http_client()
         .get(&url)
         .send()
         .await
         .map_err(|error| readiness_transport_error("send", &error))?;
+    observed();
     if !response.status().is_success() { return Ok(false); }
     // reqwest labels interrupted body collection as decode errors too. Read
     // the full bytes first so only complete JSON is a schema decision.
@@ -2109,6 +2115,28 @@ mod tests {
             let endpoint = GatewayEndpoint { url: format!("ws://127.0.0.1:{port}"), token: None, password: None, device_token: None };
             assert_eq!(http_ready_for_endpoint(&endpoint).await.unwrap(), expected);
             server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn response_observer_runs_at_headers_for_all_status_and_body_outcomes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (status, body, length) in [("503 Service Unavailable", "", 0), ("302 Found", "", 0), ("401 Unauthorized", "", 0), ("200 OK", "invalid", 7), ("200 OK", "{", 50)] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let observed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let latch = observed.clone();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buffer = [0; 4096]; socket.read(&mut buffer).await.unwrap();
+                socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+                for _ in 0..100 { if latch.load(std::sync::atomic::Ordering::SeqCst) { break; } tokio::time::sleep(Duration::from_millis(5)).await; }
+                assert!(latch.load(std::sync::atomic::Ordering::SeqCst), "observer waited for body");
+                socket.write_all(body.as_bytes()).await.unwrap();
+            });
+            let endpoint = GatewayEndpoint { url: format!("ws://{address}"), token: None, password: None, device_token: None };
+            let _ = http_ready_for_endpoint_observed(&endpoint, || observed.store(true, std::sync::atomic::Ordering::SeqCst)).await;
+            assert!(observed.load(std::sync::atomic::Ordering::SeqCst)); server.await.unwrap();
         }
     }
 

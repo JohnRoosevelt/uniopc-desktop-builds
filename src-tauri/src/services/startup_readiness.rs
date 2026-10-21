@@ -7,11 +7,18 @@ use tokio::time::{sleep, Instant};
 
 pub const CANCEL_POLL: Duration = Duration::from_millis(250);
 pub const DEADLINE_ERROR: &str = "gateway_startup_deadline_exceeded";
+pub const RECOVERED: &str = "gateway_startup_recovered";
 pub const CHILD_EXIT_ERROR: &str = "gateway_owned_child_exited";
 
 pub trait GatewayStartup: Sync {
     type Snapshot: Send;
     fn check(&self) -> Result<(), String>;
+    fn recover_stalled(&self, _deadline: Instant) -> impl Future<Output = Result<bool, String>> + Send {
+        async { Ok(false) }
+    }
+    fn finalized(&self) -> impl Future<Output = Result<(), String>> + Send {
+        async { Ok(()) }
+    }
     fn child_running(&self) -> impl Future<Output = bool> + Send;
     fn http_ready(&self) -> impl Future<Output = Result<bool, String>> + Send;
     fn auth_ready(&self) -> impl Future<Output = Result<Option<Self::Snapshot>, String>> + Send;
@@ -145,6 +152,15 @@ pub(crate) async fn owned<B: GatewayStartup, F: Future>(
         if Instant::now() >= deadline {
             return Err(DEADLINE_ERROR.into());
         }
+        let recovery_began = Instant::now();
+        if current(
+            deadline,
+            || b.check(),
+            b.recover_stalled(deadline),
+        ).await?? {
+            b.phase("gateway_startup_recovery", recovery_began.elapsed(), 1);
+            return Err(RECOVERED.into());
+        }
         if !current(deadline, || b.check(), b.child_running()).await? {
             return Err(CHILD_EXIT_ERROR.into());
         }
@@ -188,7 +204,11 @@ pub(crate) async fn wait_ready<B: GatewayStartup>(
     let mut http_recorded = false;
     loop {
         polls += 1;
-        match owned(b, deadline, b.http_ready()).await? {
+        let result = match owned(b, deadline, b.http_ready()).await {
+            Err(error) if error == RECOVERED => continue,
+            other => other?,
+        };
+        match result {
             Ok(true) => {
                 if !http_recorded {
                     b.phase("http_ready", start.elapsed(), polls);
@@ -208,7 +228,10 @@ pub(crate) async fn wait_ready<B: GatewayStartup>(
             Err(error) if transient(&error) => {}
             Err(error) => return Err(error),
         }
-        owned(b, deadline, sleep(CANCEL_POLL)).await?;
+        match owned(b, deadline, sleep(CANCEL_POLL)).await {
+            Err(error) if error == RECOVERED => continue,
+            other => other?,
+        }
     }
 }
 
@@ -300,7 +323,9 @@ pub async fn finalize<B: GatewayStartup>(b: &B, deadline: Instant) -> Result<B::
         }
     }
     b.phase("system_plugins_verify", start.elapsed(), 1);
-    wait_ready(b, deadline).await
+    let snapshot = wait_ready(b, deadline).await?;
+    owned(b, deadline, b.finalized()).await??;
+    Ok(snapshot)
 }
 
 pub fn require_hash(snapshot: &Value) -> Result<&str, String> {
@@ -425,6 +450,10 @@ mod tests {
         verify_delay: Duration,
         http_fixture: Option<(crate::services::openclaw_gateway::GatewayEndpoint, std::sync::Arc<tokio::sync::Notify>)>,
         http_errors: std::sync::atomic::AtomicUsize,
+        recovery: bool,
+        replacement_ready: bool,
+        recovery_error: Option<&'static str>,
+        recoveries: std::sync::atomic::AtomicUsize,
         state: Mutex<State>,
     }
     impl Fake {
@@ -442,6 +471,8 @@ mod tests {
                 verify_delay: Duration::ZERO,
                 http_fixture: None,
                 http_errors: std::sync::atomic::AtomicUsize::new(0),
+                recovery: false, replacement_ready: true, recovery_error: None,
+                recoveries: std::sync::atomic::AtomicUsize::new(0),
                 state: Mutex::new(State {
                     config: json!({}),
                     revision: 1,
@@ -476,6 +507,16 @@ mod tests {
                 Ok(())
             }
         }
+        async fn recover_stalled(&self, deadline: Instant) -> Result<bool, String> {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if self.recovery && self.began.elapsed() >= Duration::from_secs(360) && remaining >= Duration::from_secs(300)
+                && self.recoveries.compare_exchange(0, 1, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst).is_ok() {
+                if let Some(error) = self.recovery_error { return Err(error.into()); }
+                self.state.lock().unwrap().spawns += 1;
+                return Ok(true);
+            }
+            Ok(false)
+        }
         async fn child_running(&self) -> bool {
             self.state.lock().unwrap().running
                 && !self.exit_at.is_some_and(|at| self.began.elapsed() >= at)
@@ -492,6 +533,7 @@ mod tests {
                 }
                 return result;
             }
+            if self.recovery { return Ok(self.replacement_ready && self.recoveries.load(std::sync::atomic::Ordering::SeqCst) == 1); }
             Ok(self.began.elapsed() >= self.http_at)
         }
         async fn auth_ready(&self) -> Result<Option<Self::Snapshot>, String> {
@@ -1117,6 +1159,73 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn stalled_initial_child_recovers_once_and_repeats_full_postconditions() {
+        let mut fake = Fake::new();
+        fake.recovery = true;
+        let result = start(&fake, true, true, Duration::from_secs(900))
+            .await
+            .unwrap();
+        assert_eq!(result.snapshot, "connected");
+        let state = fake.state.lock().unwrap();
+        assert_eq!(state.spawns, 1);
+        assert_eq!(state.prepares, 0);
+        assert_eq!(state.onboards, 0);
+        assert_eq!(state.plugins, 1);
+        assert_eq!(state.patches.len(), 1);
+        assert!(fake.began.elapsed() >= Duration::from_secs(360));
+    }
+    #[tokio::test(start_paused = true)]
+    async fn stalled_replacement_never_gets_a_third_spawn_or_new_deadline() {
+        let mut fake = Fake::new();
+        fake.recovery = true;
+        fake.replacement_ready = false;
+        assert_eq!(
+            start(&fake, true, true, Duration::from_secs(900))
+                .await
+                .err()
+                .unwrap(),
+            DEADLINE_ERROR
+        );
+        assert_eq!(fake.state.lock().unwrap().spawns, 1);
+        assert_eq!(fake.began.elapsed(), Duration::from_secs(900));
+        assert_eq!(
+            start(&fake, true, true, Duration::from_secs(900))
+                .await
+                .err()
+                .unwrap(),
+            DEADLINE_ERROR
+        );
+        assert_eq!(fake.state.lock().unwrap().spawns, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn uncertain_termination_wrong_identity_and_cancellation_never_spawn_replacement() {
+        for error in [
+            "gateway_startup_termination_unconfirmed",
+            "gateway_startup_identity_changed",
+            "cancelled",
+        ] {
+            let mut fake = Fake::new();
+            fake.recovery = true;
+            fake.recovery_error = Some(error);
+            if error == "cancelled" {
+                fake.cancel_at = Some(Duration::from_secs(360));
+            }
+            assert_eq!(
+                start(&fake, true, true, Duration::from_secs(900))
+                    .await
+                    .err()
+                    .unwrap(),
+                error
+            );
+            let state = fake.state.lock().unwrap();
+            assert_eq!(state.spawns, 0);
+            assert_eq!(state.prepares, 0);
+            assert_eq!(state.onboards, 0);
+            assert_eq!(state.plugins, 0);
+        }
+    }
     #[test]
     fn unsafe_snapshots_fail_and_redacted_values_never_enter_delta() {
         assert!(safe_config(&json!({"hash":"a"})).is_err());

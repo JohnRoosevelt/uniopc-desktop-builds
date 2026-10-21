@@ -34,7 +34,7 @@ impl Drop for OwnedChild {
 }
 
 #[cfg(windows)]
-fn process_job(child: &Child) -> io::Result<std::os::windows::io::OwnedHandle> {
+pub(crate) fn process_job(child: &Child) -> io::Result<std::os::windows::io::OwnedHandle> {
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use windows_sys::Win32::System::JobObjects::*;
     let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
@@ -63,6 +63,95 @@ fn process_job(child: &Child) -> io::Result<std::os::windows::io::OwnedHandle> {
         return Err(io::Error::last_os_error());
     }
     Ok(job)
+}
+
+/// Gateway's first preload blocks on stdin. The injectable assignment seam
+/// lets native tests prove failure paths never release engine code.
+#[cfg(windows)]
+pub(crate) async fn gate_gateway_child(
+    child: &mut Child,
+    assign: impl FnOnce(&Child) -> io::Result<std::os::windows::io::OwnedHandle>,
+) -> io::Result<std::os::windows::io::OwnedHandle> {
+    use tokio::io::AsyncWriteExt;
+    let job = match assign(child) {
+        Ok(job) => job,
+        Err(error) => {
+            let _ = child.kill().await;
+            return Err(error);
+        }
+    };
+    let ack = async {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::other("missing private startup pipe"))?;
+        stdin.write_all(&[0xa7]).await?;
+        stdin.shutdown().await?;
+        Ok::<_, io::Error>(())
+    };
+    if !matches!(
+        tokio::time::timeout(Duration::from_secs(2), ack).await,
+        Ok(Ok(()))
+    ) {
+        terminate_job(&job, child).await?;
+        return Err(io::Error::other("private startup ACK failed"));
+    }
+    Ok(job)
+}
+
+/// Terminate only this held job, then prove all members exited. A failed
+/// query or timeout leaves recovery blocked; a leader exit alone is insufficient.
+#[cfg(windows)]
+pub(crate) async fn terminate_job(
+    job: &std::os::windows::io::OwnedHandle,
+    child: &mut Child,
+) -> io::Result<()> {
+    request_job_termination(job)?;
+    confirm_job_termination(job, child).await
+}
+
+#[cfg(windows)]
+pub(crate) fn request_job_termination(job: &std::os::windows::io::OwnedHandle) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+    if unsafe { TerminateJobObject(job.as_raw_handle(), 1) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(crate) async fn confirm_job_termination(
+    job: &std::os::windows::io::OwnedHandle,
+    child: &mut Child,
+) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::JobObjects::*;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
+            if unsafe {
+                QueryInformationJobObject(
+                    job.as_raw_handle(),
+                    JobObjectBasicAccountingInformation,
+                    &mut info as *mut _ as *mut _,
+                    std::mem::size_of_val(&info) as u32,
+                    std::ptr::null_mut(),
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if info.ActiveProcesses == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        child.wait().await?;
+        Ok(())
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "owned job termination unconfirmed"))?
 }
 
 #[cfg(unix)]
