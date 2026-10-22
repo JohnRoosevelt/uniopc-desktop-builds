@@ -4,7 +4,7 @@
 //! version checks, process execution, and startup health verification.
 
 use super::{
-    build_openclaw_status, emit_openclaw_progress, gateway_log_path, GatewayLogTail,
+    build_openclaw_observed_status, emit_openclaw_progress, gateway_log_path, GatewayLogTail,
     OpenClawInstallResult, OpenClawSetupProgress, OpenClawStatus,
 };
 use crate::services::uniopc_runtime_paths;
@@ -43,7 +43,7 @@ pub(super) fn read_gateway_log_tail_impl(
 }
 
 async fn openclaw_status_impl(app: AppHandle) -> Result<OpenClawStatus, String> {
-    Ok(build_openclaw_status(&app).await)
+    Ok(build_openclaw_observed_status(&app).await)
 }
 
 async fn openclaw_check_update_impl(app: AppHandle) -> Result<OpenClawStatus, String> {

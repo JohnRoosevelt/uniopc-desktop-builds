@@ -298,40 +298,83 @@ fn verify_archive_cached(
     Ok(true)
 }
 
-/// Version of the openclaw npm package installed under a runtime dir, if any.
-pub fn installed_openclaw_version(runtime_dir: &Path) -> Option<String> {
+/// The selected package and its bytes must come from the same resolver for
+/// ordinary verification and observed-status fingerprints.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+struct InstalledPackage {
+    path: PathBuf,
+    version: String,
+    bytes: Vec<u8>,
+    file: fs::File,
+}
+
+fn open_runtime_file(path: &Path, attributes_only: bool) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+        if attributes_only {
+            options.access_mode(FILE_READ_ATTRIBUTES);
+        } else {
+            options.read(true);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = attributes_only;
+        options.read(true);
+    }
+    options.open(path)
+}
+
+fn installed_openclaw_package(runtime_dir: &Path) -> Option<InstalledPackage> {
+    use std::io::Read;
     let tools_dir = runtime_dir.join("tools");
-    let read_version = |package_json: &Path| -> Option<String> {
-        let raw = fs::read_to_string(package_json).ok()?;
-        let json: serde_json::Value = serde_json::from_str(&raw).ok()?;
-        json.get("version")
+    let read_package = |path: &Path| -> Option<InstalledPackage> {
+        let mut file = open_runtime_file(path, false).ok()?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).ok()?;
+        let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        let version = json
+            .get("version")
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
+            .filter(|value| !value.is_empty())?
+            .to_owned();
+        Some(InstalledPackage {
+            path: path.to_owned(),
+            version,
+            bytes,
+            file,
+        })
     };
-    // Unix install-cli.sh layout keeps global modules under `lib/node_modules`;
-    // Windows npm keeps them at the prefix root (`node_modules`). Probe both so
-    // the same detector works for the macOS bundle and the Windows provision.
     let module_suffixes: [&[&str]; 2] = [
         &["lib", "node_modules", "uniopc-engine", "package.json"],
         &["node_modules", "uniopc-engine", "package.json"],
     ];
     let alias_root = tools_dir.join("node");
     for suffix in module_suffixes {
-        if let Some(version) = read_version(&join_all(&alias_root, suffix)) {
-            return Some(version);
+        if let Some(package) = read_package(&join_all(&alias_root, suffix)) {
+            return Some(package);
         }
     }
     for entry in fs::read_dir(tools_dir).ok()?.filter_map(Result::ok) {
-        let root = entry.path();
         for suffix in module_suffixes {
-            if let Some(version) = read_version(&join_all(&root, suffix)) {
-                return Some(version);
+            if let Some(package) = read_package(&join_all(&entry.path(), suffix)) {
+                return Some(package);
             }
         }
     }
     None
+}
+
+/// Version of the openclaw npm package installed under a runtime dir, if any.
+pub fn installed_openclaw_version(runtime_dir: &Path) -> Option<String> {
+    installed_openclaw_package(runtime_dir).map(|package| package.version)
 }
 
 fn join_all(base: &Path, parts: &[&str]) -> PathBuf {
@@ -443,20 +486,276 @@ fn current_runtime_pointer_version() -> Option<String> {
     current_runtime_pointer_version_at(&runtime_paths::runtime_base_dir().ok()?)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RuntimePointerSource {
+    Link(PathBuf),
+    Marker(String),
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+struct RuntimePointer {
+    runtime_id: String,
+    source: RuntimePointerSource,
+}
+
 fn current_runtime_pointer_version_at(base: &Path) -> Option<String> {
-    let from_link = fs::read_link(base.join("current")).ok().and_then(|target| {
-        target
-            .file_name()
-            .map(|name| name.to_string_lossy().to_string())
-            .and_then(|name| name.strip_prefix('v').map(str::to_string))
-    });
-    let version = from_link.or_else(|| {
-        fs::read_to_string(base.join("current.version"))
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-    })?;
-    Some(version)
+    selected_runtime_pointer_at(base).map(|pointer| pointer.runtime_id)
+}
+
+fn selected_runtime_pointer_at(base: &Path) -> Option<RuntimePointer> {
+    if let Some((runtime_id, target)) =
+        fs::read_link(base.join("current")).ok().and_then(|target| {
+            let runtime_id = target
+                .file_name()?
+                .to_string_lossy()
+                .strip_prefix('v')?
+                .to_owned();
+            Some((runtime_id, target))
+        })
+    {
+        return Some(RuntimePointer {
+            runtime_id,
+            source: RuntimePointerSource::Link(target),
+        });
+    }
+    let marker = fs::read_to_string(base.join("current.version")).ok()?;
+    let runtime_id = marker.trim().to_owned();
+    if runtime_id.is_empty() {
+        return None;
+    }
+    Some(RuntimePointer {
+        runtime_id,
+        source: RuntimePointerSource::Marker(marker),
+    })
+}
+
+pub type BundledRuntimeStatusTuple = (String, String, Option<String>);
+
+/// External observed status only. Operations must use the uncached verifier.
+#[cfg(windows)]
+pub async fn observed_bundled_runtime_status(
+    required: String,
+) -> Option<BundledRuntimeStatusTuple> {
+    use std::sync::{Arc, OnceLock};
+    static CACHE: OnceLock<Arc<Mutex<observed_status::Cache>>> = OnceLock::new();
+    let base = runtime_paths::runtime_base_dir().ok();
+    observed_status::observe(
+        CACHE
+            .get_or_init(|| Arc::new(Mutex::new(observed_status::Cache::default())))
+            .clone(),
+        move || {
+            base.as_deref()
+                .and_then(|base| observed_status::Snapshot::capture(base, &required))
+        },
+        |snapshot| runtime_dir_is_valid_at(&snapshot.root, &snapshot.required),
+    )
+    .await
+}
+
+#[cfg(any(windows, test))]
+mod observed_status {
+    use super::*;
+    use sha2::{Digest, Sha256};
+    use std::sync::Arc;
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(super) struct FileIdentity {
+        pub(super) path: PathBuf,
+        pub(super) volume: u64,
+        pub(super) id: u64,
+        pub(super) len: u64,
+        pub(super) creation: [u64; 2],
+        pub(super) write: [u64; 2],
+    }
+
+    #[cfg(windows)]
+    pub(super) fn file_identity(file: &fs::File) -> Option<FileIdentity> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, GetFileType, GetFinalPathNameByHandleW,
+            BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DEVICE, FILE_ATTRIBUTE_DIRECTORY,
+            FILE_TYPE_DISK,
+        };
+        // File is the sole owner. The Win32 APIs only borrow this handle.
+        let handle = file.as_raw_handle();
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileType(handle) } != FILE_TYPE_DISK
+            || unsafe { GetFileInformationByHandle(handle, &mut info) } == 0
+            || info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_DEVICE) != 0
+        {
+            return None;
+        }
+        let id = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+        if id == 0 {
+            return None;
+        }
+        let mut capacity = 260usize;
+        let mut path = None;
+        for _ in 0..4 {
+            let mut buffer = vec![0u16; capacity];
+            let len = unsafe {
+                GetFinalPathNameByHandleW(handle, buffer.as_mut_ptr(), buffer.len() as u32, 0)
+            } as usize;
+            if len == 0 || len > 32768 {
+                return None;
+            }
+            if len < buffer.len() {
+                use std::os::windows::ffi::OsStringExt;
+                path = Some(PathBuf::from(std::ffi::OsString::from_wide(&buffer[..len])));
+                break;
+            }
+            capacity = len.checked_add(1)?;
+        }
+        Some(FileIdentity {
+            path: path?,
+            volume: u64::from(info.dwVolumeSerialNumber),
+            id,
+            len: (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow),
+            creation: [
+                u64::from(info.ftCreationTime.dwHighDateTime),
+                u64::from(info.ftCreationTime.dwLowDateTime),
+            ],
+            write: [
+                u64::from(info.ftLastWriteTime.dwHighDateTime),
+                u64::from(info.ftLastWriteTime.dwLowDateTime),
+            ],
+        })
+    }
+
+    #[cfg(all(test, unix))]
+    pub(super) fn file_identity(file: &fs::File) -> Option<FileIdentity> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata().ok()?;
+        if !metadata.is_file() || metadata.ino() == 0 {
+            return None;
+        }
+        // This branch only exercises the platform-independent cache protocol.
+        Some(FileIdentity {
+            path: PathBuf::new(),
+            volume: metadata.dev(),
+            id: metadata.ino(),
+            len: metadata.len(),
+            creation: [metadata.ctime() as u64, metadata.ctime_nsec() as u64],
+            write: [metadata.mtime() as u64, metadata.mtime_nsec() as u64],
+        })
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(super) struct Snapshot {
+        pointer: RuntimePointer,
+        pub(super) root: PathBuf,
+        canonical_root: PathBuf,
+        pub(super) required: String,
+        engine_contract: String,
+        node_contract: String,
+        node: FileIdentity,
+        package_path: PathBuf,
+        package: FileIdentity,
+        package_digest: [u8; 32],
+        shim: FileIdentity,
+        shim_digest: [u8; 32],
+        tuple: BundledRuntimeStatusTuple,
+    }
+    impl Snapshot {
+        pub(super) fn capture(base: &Path, required: &str) -> Option<Self> {
+            use std::io::Read;
+            if required != OPENCLAW_ENGINE_VERSION {
+                return None;
+            }
+            let pointer = selected_runtime_pointer_at(base)?;
+            let root = base.join(format!("v{}", pointer.runtime_id));
+            let canonical_root = fs::canonicalize(&root).ok()?;
+            if root.join(INSTALLING_MARKER).try_exists().ok()? {
+                return None;
+            }
+            let package = installed_openclaw_package(&root)?;
+            if package.version != required {
+                return None;
+            }
+            let node_file = open_runtime_file(&runtime_node_path(&root), true).ok()?;
+            let shim_path = runtime_shim_path(&root);
+            let mut shim_file = open_runtime_file(&shim_path, false).ok()?;
+            let mut shim_bytes = Vec::new();
+            shim_file.read_to_end(&mut shim_bytes).ok()?;
+            let node_label = fs::read_link(root.join("tools/node"))
+                .ok()
+                .and_then(|path| {
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().to_string())
+                })
+                .map(|name| name.strip_prefix("node-").unwrap_or(&name).to_owned());
+            let snapshot = Self {
+                pointer,
+                root: root.clone(),
+                canonical_root,
+                required: required.to_owned(),
+                engine_contract: OPENCLAW_ENGINE_VERSION.to_owned(),
+                node_contract:
+                    crate::services::openclaw_runtime_catalog::OPENCLAW_RELEASE_NODE_VERSION
+                        .to_owned(),
+                node: file_identity(&node_file)?,
+                package_path: package.path,
+                package: file_identity(&package.file)?,
+                package_digest: Sha256::digest(package.bytes).into(),
+                shim: file_identity(&shim_file)?,
+                shim_digest: Sha256::digest(shim_bytes).into(),
+                tuple: (
+                    shim_path.to_string_lossy().to_string(),
+                    required.to_owned(),
+                    node_label,
+                ),
+            };
+            if root.join(INSTALLING_MARKER).try_exists().ok()? {
+                return None;
+            }
+            Some(snapshot)
+        }
+    }
+
+    #[derive(Default)]
+    pub(super) struct Cache {
+        entry: Option<Snapshot>,
+    }
+    impl Cache {
+        pub(super) fn get_or_verify(
+            &mut self,
+            mut capture: impl FnMut() -> Option<Snapshot>,
+            verify: impl FnOnce(&Snapshot) -> bool,
+        ) -> Option<BundledRuntimeStatusTuple> {
+            let Some(before) = capture() else {
+                self.entry = None;
+                return None;
+            };
+            if let Some(entry) = self.entry.as_ref().filter(|entry| *entry == &before) {
+                return Some(entry.tuple.clone());
+            }
+            self.entry = None;
+            if !verify(&before) {
+                return None;
+            }
+            let after = capture()?;
+            if before != after {
+                return None;
+            }
+            let tuple = before.tuple.clone();
+            self.entry = Some(before);
+            Some(tuple)
+        }
+    }
+    pub(super) async fn observe(
+        cache: Arc<Mutex<Cache>>,
+        capture: impl FnMut() -> Option<Snapshot> + Send + 'static,
+        verify: impl FnOnce(&Snapshot) -> bool + Send + 'static,
+    ) -> Option<BundledRuntimeStatusTuple> {
+        tokio::task::spawn_blocking(move || {
+            // Acquired inside the blocking task: dropping an async waiter cannot
+            // release the singleflight lock while its Node probe is still alive.
+            cache.lock().ok()?.get_or_verify(capture, verify)
+        })
+        .await
+        .ok()
+        .flatten()
+    }
 }
 
 /// The gateway may start only after `current_runtime_version` has checked the
@@ -889,9 +1188,11 @@ pub fn ensure_bundled_runtime_installed(app: &AppHandle) -> Result<BundledRuntim
 /// Warm-start fast check used by the status fast path: true when
 /// `runtime/current` resolves to a valid install of `version`.
 pub fn active_runtime_matches(version: &str) -> bool {
-    current_runtime_version()
-        .as_deref()
-        .is_some_and(|runtime_id| runtime_dir_is_valid(runtime_id, version))
+    active_runtime_matches_with(version, current_runtime_version)
+}
+
+fn active_runtime_matches_with(version: &str, verify: impl FnOnce() -> Option<String>) -> bool {
+    version == OPENCLAW_ENGINE_VERSION && verify().is_some()
 }
 
 /// Point `runtime/current` at an already-installed version dir (used after
@@ -906,6 +1207,409 @@ pub fn activate_runtime_version(version: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_status_active_matches_requires_exact_pin_and_one_full_validation() {
+        use std::cell::Cell;
+        let calls = Cell::new(0);
+        let verify = || {
+            calls.set(calls.get() + 1);
+            Some("artifact-runtime-id".to_owned())
+        };
+        assert!(!active_runtime_matches_with("wrong", verify));
+        assert_eq!(calls.get(), 0);
+        assert!(active_runtime_matches_with(OPENCLAW_ENGINE_VERSION, verify));
+        assert_eq!(calls.get(), 1);
+        assert!(!active_runtime_matches_with(
+            OPENCLAW_ENGINE_VERSION,
+            || None
+        ));
+    }
+
+    struct StatusFixture {
+        base: PathBuf,
+        root: PathBuf,
+    }
+    impl StatusFixture {
+        fn new() -> Self {
+            use std::sync::OnceLock;
+            static NODE_FIXTURE: OnceLock<PathBuf> = OnceLock::new();
+            let binary = NODE_FIXTURE.get_or_init(|| {
+                let dir = std::env::temp_dir().join(format!("uniopc-status-node-{}", uuid::Uuid::new_v4()));
+                fs::create_dir_all(&dir).unwrap();
+                let source = dir.join("fixture.rs");
+                fs::write(&source, r#"
+use std::io::Write;
+fn main() {
+    assert_eq!(std::env::args().nth(1).as_deref(), Some("--version"));
+    let counter = std::env::current_exe().unwrap().with_file_name("probes");
+    writeln!(std::fs::OpenOptions::new().create(true).append(true).open(counter).unwrap(), "probe").unwrap();
+    println!("v24.19.0");
+}
+"#).unwrap();
+                let binary = dir.join(if cfg!(windows) { "node.exe" } else { "node" });
+                let output = Command::new("rustc").arg("--crate-name").arg("status_node_fixture")
+                    .arg(&source).arg("-o").arg(&binary).output().unwrap();
+                assert!(output.status.success(), "fixture rustc: {}", String::from_utf8_lossy(&output.stderr));
+                binary
+            });
+            let base = std::env::temp_dir().join(format!("uniopc-status-{}", uuid::Uuid::new_v4()));
+            let root = base.join("vfixture");
+            let package = root.join("tools/node/node_modules/uniopc-engine/package.json");
+            fs::create_dir_all(package.parent().unwrap()).unwrap();
+            fs::create_dir_all(runtime_shim_path(&root).parent().unwrap()).unwrap();
+            fs::create_dir_all(runtime_node_path(&root).parent().unwrap()).unwrap();
+            fs::copy(binary, runtime_node_path(&root)).unwrap();
+            fs::write(
+                &package,
+                serde_json::json!({"version": OPENCLAW_ENGINE_VERSION}).to_string(),
+            )
+            .unwrap();
+            fs::write(runtime_shim_path(&root), "shim fixture").unwrap();
+            fs::write(base.join("current.version"), "fixture").unwrap();
+            Self { base, root }
+        }
+        fn snapshot(&self) -> Option<observed_status::Snapshot> {
+            observed_status::Snapshot::capture(&self.base, OPENCLAW_ENGINE_VERSION)
+        }
+        fn probes(&self) -> usize {
+            fs::read_to_string(runtime_node_path(&self.root).with_file_name("probes"))
+                .unwrap_or_default()
+                .lines()
+                .count()
+        }
+        fn observe(&self, cache: &mut observed_status::Cache) -> Option<BundledRuntimeStatusTuple> {
+            cache.get_or_verify(
+                || self.snapshot(),
+                |snapshot| runtime_dir_is_valid_at(&snapshot.root, &snapshot.required),
+            )
+        }
+        fn package(&self) -> PathBuf {
+            self.root
+                .join("tools/node/node_modules/uniopc-engine/package.json")
+        }
+    }
+    impl Drop for StatusFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.base);
+        }
+    }
+
+    #[test]
+    fn windows_status_complete_tuple_cached_only_after_one_full_probe() {
+        let fixture = StatusFixture::new();
+        let mut cache = observed_status::Cache::default();
+        let expected = fixture.observe(&mut cache).unwrap();
+        for _ in 0..100 {
+            assert_eq!(fixture.observe(&mut cache), Some(expected.clone()));
+        }
+        assert_eq!(fixture.probes(), 1);
+        // The operation verifier has no dependency on the observation cache.
+        assert!(runtime_dir_is_valid_at(
+            &fixture.root,
+            OPENCLAW_ENGINE_VERSION
+        ));
+        assert!(runtime_dir_is_valid_at(
+            &fixture.root,
+            OPENCLAW_ENGINE_VERSION
+        ));
+        assert_eq!(fixture.probes(), 3);
+        assert!(observed_status::Snapshot::capture(&fixture.base, "wrong requested pin").is_none());
+        assert_eq!(fixture.probes(), 3);
+    }
+
+    #[test]
+    fn windows_status_marker_pointer_package_shim_and_query_failures_invalidate() {
+        let fixture = StatusFixture::new();
+        let mut cache = observed_status::Cache::default();
+        fixture.observe(&mut cache).unwrap();
+        fs::write(fixture.root.join(INSTALLING_MARKER), "installing").unwrap();
+        assert!(fixture.observe(&mut cache).is_none());
+        assert_eq!(fixture.probes(), 1);
+        fs::remove_file(fixture.root.join(INSTALLING_MARKER)).unwrap();
+        fixture.observe(&mut cache).unwrap();
+        assert_eq!(fixture.probes(), 2);
+        fs::write(
+            fixture.package(),
+            format!(
+                "{{\"version\":\"{}\",\"extra\":true}}",
+                OPENCLAW_ENGINE_VERSION
+            ),
+        )
+        .unwrap();
+        fixture.observe(&mut cache).unwrap();
+        assert_eq!(fixture.probes(), 3);
+        fs::write(runtime_shim_path(&fixture.root), "new shim fixture").unwrap();
+        fixture.observe(&mut cache).unwrap();
+        assert_eq!(fixture.probes(), 4);
+        // Any unavailable identity/query invalidates the positive entry.
+        assert!(cache
+            .get_or_verify(|| None, |_| panic!("no full probe on snapshot error"))
+            .is_none());
+        fixture.observe(&mut cache).unwrap();
+        assert_eq!(fixture.probes(), 5);
+        fs::write(fixture.base.join("current.version"), "missing").unwrap();
+        assert!(fixture.observe(&mut cache).is_none());
+        fs::write(fixture.base.join("current.version"), "fixture").unwrap();
+        fixture.observe(&mut cache).unwrap();
+        assert_eq!(fixture.probes(), 6);
+        fs::write(fixture.package(), r#"{"version":"unsupported"}"#).unwrap();
+        assert!(fixture.observe(&mut cache).is_none());
+        assert_eq!(fixture.probes(), 6);
+        fs::remove_file(fixture.package()).unwrap();
+        assert!(fixture.observe(&mut cache).is_none());
+    }
+
+    #[test]
+    fn windows_status_resolver_uses_selected_fallback_package_bytes() {
+        let fixture = StatusFixture::new();
+        // The same resolver skips invalid JSON in the preferred layout.
+        let preferred = fixture
+            .root
+            .join("tools/node/lib/node_modules/uniopc-engine/package.json");
+        fs::create_dir_all(preferred.parent().unwrap()).unwrap();
+        fs::write(&preferred, "invalid JSON").unwrap();
+        assert_eq!(
+            installed_openclaw_package(&fixture.root).unwrap().path,
+            fixture.package()
+        );
+        let mut cache = observed_status::Cache::default();
+        fixture.observe(&mut cache).unwrap();
+        fs::write(
+            &preferred,
+            serde_json::json!({"version": OPENCLAW_ENGINE_VERSION}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            installed_openclaw_package(&fixture.root).unwrap().path,
+            preferred
+        );
+        fixture.observe(&mut cache).unwrap();
+        assert_eq!(fixture.probes(), 2);
+        fs::remove_file(&preferred).unwrap();
+        fs::remove_file(fixture.package()).unwrap();
+        let fallback = fixture
+            .root
+            .join("tools/other/node_modules/uniopc-engine/package.json");
+        fs::create_dir_all(fallback.parent().unwrap()).unwrap();
+        fs::write(
+            &fallback,
+            serde_json::json!({"version": OPENCLAW_ENGINE_VERSION}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            installed_openclaw_package(&fixture.root).unwrap().path,
+            fallback
+        );
+        fixture.observe(&mut cache).unwrap();
+        assert_eq!(fixture.probes(), 3);
+        fs::write(
+            &fallback,
+            format!(
+                "{{\"version\":\"{}\",\"changed\":1}}",
+                OPENCLAW_ENGINE_VERSION
+            ),
+        )
+        .unwrap();
+        fixture.observe(&mut cache).unwrap();
+        assert_eq!(fixture.probes(), 4);
+    }
+
+    #[test]
+    fn windows_status_validation_change_never_publishes_mixed_tuple_or_negative_cache() {
+        let fixture = StatusFixture::new();
+        let other = StatusFixture::new();
+        let next_root = fixture.base.join("vnext");
+        fs::rename(&other.root, &next_root).unwrap();
+        let mut cache = observed_status::Cache::default();
+        assert!(cache
+            .get_or_verify(
+                || fixture.snapshot(),
+                |snapshot| {
+                    assert!(runtime_dir_is_valid_at(&snapshot.root, &snapshot.required));
+                    fs::write(fixture.base.join("current.version"), "next").unwrap();
+                    true
+                }
+            )
+            .is_none());
+        assert_eq!(fixture.probes(), 1);
+        let next_tuple = fixture.observe(&mut cache).unwrap();
+        assert_eq!(
+            next_tuple.0,
+            runtime_shim_path(&next_root).to_string_lossy()
+        );
+        assert_eq!(
+            fs::read_to_string(runtime_node_path(&next_root).with_file_name("probes"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        fs::write(fixture.base.join("current.version"), "fixture").unwrap();
+        assert!(cache
+            .get_or_verify(|| fixture.snapshot(), |_| false)
+            .is_none());
+        assert!(fixture.observe(&mut cache).is_some());
+        assert_eq!(fixture.probes(), 2);
+    }
+
+    #[test]
+    fn windows_status_same_length_and_write_time_replacement_changes_identity() {
+        let fixture = StatusFixture::new();
+        let mut cache = observed_status::Cache::default();
+        fixture.observe(&mut cache).unwrap();
+        let node = runtime_node_path(&fixture.root);
+        let before =
+            observed_status::file_identity(&open_runtime_file(&node, true).unwrap()).unwrap();
+        let modified = fs::metadata(&node).unwrap().modified().unwrap();
+        let replacement = node.with_file_name("replacement");
+        fs::copy(&node, &replacement).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        fs::remove_file(&node).unwrap();
+        fs::rename(&replacement, &node).unwrap();
+        let after =
+            observed_status::file_identity(&open_runtime_file(&node, true).unwrap()).unwrap();
+        assert_eq!(before.len, after.len);
+        assert_eq!(before.write, after.write);
+        assert_ne!(before.id, after.id);
+        assert!(fixture.observe(&mut cache).is_some());
+        assert_eq!(fixture.probes(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn windows_status_cancelled_leader_and_twenty_waiters_share_one_full_probe() {
+        use std::sync::{Arc, Condvar};
+        let fixture = Arc::new(StatusFixture::new());
+        let cache = Arc::new(Mutex::new(observed_status::Cache::default()));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let leader = {
+            let (fixture, cache, entered, gate) = (
+                fixture.clone(),
+                cache.clone(),
+                entered.clone(),
+                gate.clone(),
+            );
+            tokio::spawn(async move {
+                let capture_fixture = fixture.clone();
+                observed_status::observe(
+                    cache,
+                    move || capture_fixture.snapshot(),
+                    move |snapshot| {
+                        entered.notify_one();
+                        let (mutex, condvar) = &*gate;
+                        let mut released = mutex.lock().unwrap();
+                        while !*released {
+                            released = condvar.wait(released).unwrap();
+                        }
+                        runtime_dir_is_valid_at(&snapshot.root, &snapshot.required)
+                    },
+                )
+                .await
+            })
+        };
+        entered.notified().await;
+        leader.abort();
+        let mut waiters = Vec::new();
+        for _ in 0..20 {
+            let (fixture, cache) = (fixture.clone(), cache.clone());
+            waiters.push(tokio::spawn(async move {
+                observed_status::observe(
+                    cache,
+                    move || fixture.snapshot(),
+                    |snapshot| runtime_dir_is_valid_at(&snapshot.root, &snapshot.required),
+                )
+                .await
+            }));
+        }
+        tokio::task::yield_now().await;
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        for waiter in waiters {
+            assert!(waiter.await.unwrap().is_some());
+        }
+        assert_eq!(fixture.probes(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_status_native_identity_failure_does_not_hit_or_publish() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let fixture = StatusFixture::new();
+        let mut cache = observed_status::Cache::default();
+        fixture.observe(&mut cache).unwrap();
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(runtime_shim_path(&fixture.root))
+            .unwrap();
+        assert!(fixture.observe(&mut cache).is_none());
+        drop(held);
+        fixture.observe(&mut cache).unwrap();
+        assert_eq!(fixture.probes(), 2);
+        assert!(observed_status::file_identity(&fs::File::open("NUL").unwrap()).is_none());
+        let directory = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&fixture.root)
+            .unwrap();
+        assert!(observed_status::file_identity(&directory).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_status_native_handle_fixture() {
+        if std::env::var_os("UNIOPC_STATUS_HANDLE_FIXTURE").is_none() {
+            return;
+        }
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
+        let fixture = StatusFixture::new();
+        fixture.snapshot().unwrap();
+        let count = || {
+            let mut count = 0;
+            assert_ne!(
+                unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) },
+                0
+            );
+            count
+        };
+        let before = count();
+        for _ in 0..1000 {
+            fixture.snapshot().unwrap();
+        }
+        assert_eq!(
+            count(),
+            before,
+            "File RAII must close every identity-query handle"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_status_native_handle_queries_do_not_leak() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "services::openclaw_bundled_runtime::tests::windows_status_native_handle_fixture",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env("UNIOPC_STATUS_HANDLE_FIXTURE", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    }
 
     #[cfg(unix)]
     #[tokio::test]

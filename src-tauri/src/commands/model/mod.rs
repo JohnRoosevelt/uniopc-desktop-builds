@@ -7132,13 +7132,31 @@ fn bundled_runtime_status_probe() -> Option<(String, String, Option<String>)> {
 }
 
 async fn build_openclaw_status(app: &AppHandle) -> OpenClawStatus {
+    build_openclaw_status_with_probe(app, bundled_runtime_status_probe()).await
+}
+
+/// Only the external read-only status command uses the observed cache.
+async fn build_openclaw_observed_status(app: &AppHandle) -> OpenClawStatus {
+    #[cfg(windows)]
+    let probe =
+        openclaw_bundled_runtime::observed_bundled_runtime_status(imai_openclaw_install_version())
+            .await;
+    #[cfg(not(windows))]
+    let probe = bundled_runtime_status_probe();
+    build_openclaw_status_with_probe(app, probe).await
+}
+
+async fn build_openclaw_status_with_probe(
+    app: &AppHandle,
+    bundled_probe: Option<openclaw_bundled_runtime::BundledRuntimeStatusTuple>,
+) -> OpenClawStatus {
     let supported =
         cfg!(target_os = "windows") || cfg!(target_os = "macos") || cfg!(target_os = "linux");
     let (binary_path, version, node_version) = if let Some((
         bundled_binary,
         bundled_version,
         bundled_node,
-    )) = bundled_runtime_status_probe()
+    )) = bundled_probe
     {
         (
             Some(bundled_binary),
@@ -7923,6 +7941,35 @@ mod tests {
             restart_attempts.load(std::sync::atomic::Ordering::SeqCst),
             0
         );
+    }
+
+    #[test]
+    fn observed_status_cache_is_only_used_by_external_status_command() {
+        let boundary = include_str!("runtime.rs");
+        let external = boundary
+            .split("async fn openclaw_status_impl(")
+            .nth(1)
+            .unwrap()
+            .split("async fn openclaw_check_update_impl(")
+            .next()
+            .unwrap();
+        assert!(external.contains("build_openclaw_observed_status(&app).await"));
+        assert_eq!(
+            boundary
+                .matches("build_openclaw_observed_status(&app).await")
+                .count(),
+            1
+        );
+        let model = include_str!("mod.rs");
+        let default_builder = model
+            .split("async fn build_openclaw_status(app:")
+            .nth(1)
+            .unwrap()
+            .split("async fn build_openclaw_observed_status(app:")
+            .next()
+            .unwrap();
+        assert!(default_builder.contains("bundled_runtime_status_probe()"));
+        assert!(!default_builder.contains("observed_bundled_runtime_status"));
     }
 
     #[cfg(unix)]
