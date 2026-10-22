@@ -4,6 +4,8 @@ import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promis
 import { tmpdir } from 'node:os'
 import path, { join } from 'node:path'
 import { createHash } from 'node:crypto'
+import { spawnSync } from 'node:child_process'
+import { pathToFileURL } from 'node:url'
 
 import { rebrandEngineWrapperContract, rebrandPluginManifestPaths, rebrandCompiledRuntimePaths, rebrandDisplayMetadata, rebrandVisibleText } from './uniopc-runtime-branding.mjs'
 
@@ -186,4 +188,88 @@ test('pinned main, config-doctor and worker derivations retain database hashes a
         join(runtimeDirectory, `uniopc-state-locks${uid === undefined ? '' : '-501'}`, `${family}.${hash}.lock.sqlite`))
     }
   }
+})
+
+
+async function largeDistFixture(t) {
+  const root = await mkdtemp(join(tmpdir(), 'uniopc-rebrand-fd-'))
+  t.after(() => rm(root, {recursive: true, force: true}))
+  await mkdir(join(root, 'dist'))
+  // Fixture setup is sequential too: it must not exhaust the test runner's FDs.
+  for (let index = 0; index < 1024; index++) {
+    const extension = ['js', 'mjs', 'cjs', 'ts', 'mts', 'json', 'html', 'css', 'map'][index % 9]
+    await writeFile(join(root, 'dist', `chunk-${String(index).padStart(4, '0')}.${extension}`), '"./openclaw-chunk.js"')
+  }
+  await addLifecycleFixtures(root)
+  await writeFile(join(root, 'dist/openclaw-chunk.js'), 'const ready = true;')
+  await writeFile(join(root, 'dist/paths-fixture.js'), 'const suffix = uid != null ? `openclaw-${uid}` : "openclaw";')
+  return root
+}
+
+async function distSnapshot(root) {
+  const files = []
+  async function visit(directory) {
+    for (const entry of await readdir(directory, {withFileTypes: true})) {
+      const file = join(directory, entry.name)
+      if (entry.isDirectory()) await visit(file)
+      else files.push([path.relative(root, file), createHash('sha256').update(await readFile(file)).digest('hex')])
+    }
+  }
+  await visit(join(root, 'dist'))
+  return files.sort(([a], [b]) => a.localeCompare(b))
+}
+
+function transformWithLowFdLimit(moduleUrl, root) {
+  const program = `import { rebrandCompiledRuntimePaths } from ${JSON.stringify(moduleUrl)};
+try { await rebrandCompiledRuntimePaths(process.argv[1]); }
+catch (error) { console.error(error.code || error.message); process.exitCode = 1; }`
+  // Positional arguments avoid shell interpolation of paths or source code.
+  return spawnSync('/bin/sh', ['-c', 'ulimit -n 64 || exit 90; exec "$@"', 'fd-limit-test',
+    process.execPath, '--input-type=module', '-e', program, root], {encoding: 'utf8', timeout: 60000})
+}
+
+test('large dist preflight uses bounded file handles and preserves full coverage and idempotence', async t => {
+  const root = await largeDistFixture(t)
+  const before = await distSnapshot(root)
+  if (process.platform !== 'win32') {
+    // Reconstruct the previous unbounded reader without requiring Git history.
+    // Run it only on the isolated fixture, never on an installed/live runtime.
+    const currentSource = await readFile(new URL('./uniopc-runtime-branding.mjs', import.meta.url), 'utf8')
+    const sequentialReader = "const sources = []\n  for (const path of textFiles) sources.push({path, source: await readFile(path, 'utf8')})"
+    assert.equal(currentSource.split(sequentialReader).length, 2, 'bounded reader fixture anchor drift')
+    const parentSource = currentSource.replace(sequentialReader,
+      "const sources = await Promise.all(textFiles.map(async path => ({path, source: await readFile(path, 'utf8')})))")
+      .replace(/from '(\.\/[^']+)'/g, (_, relative) => `from '${new URL(relative, import.meta.url).href}'`)
+    const parentModule = join(root, 'parent-branding.mjs')
+    await writeFile(parentModule, parentSource)
+    const oldResult = transformWithLowFdLimit(pathToFileURL(parentModule).href, root)
+    assert.equal(oldResult.error, undefined)
+    assert.notEqual(oldResult.status, 0)
+    assert.match(oldResult.stderr, /EMFILE/)
+    assert.deepEqual(await distSnapshot(root), before)
+    t.diagnostic('Unbounded reader fixture under soft FD limit 64: EMFILE; fixture bytes and names unchanged')
+    const result = transformWithLowFdLimit(new URL('./uniopc-runtime-branding.mjs', import.meta.url).href, root)
+    assert.equal(result.error, undefined)
+    assert.equal(result.status, 0, result.stderr)
+    t.diagnostic('Current implementation under soft FD limit 64: success')
+  } else {
+    t.diagnostic('POSIX soft FD limit comparison unavailable on Windows; large-directory conversion still runs')
+    await rebrandCompiledRuntimePaths(root)
+  }
+  const after = await distSnapshot(root)
+  assert.ok(after.some(([name]) => name === 'dist/uniopc-chunk.js'))
+  assert.ok(!after.some(([name]) => name === 'dist/openclaw-chunk.js'))
+  for (const [name] of after.filter(([name]) => /chunk-\d+\./.test(name))) {
+    assert.equal(await readFile(join(root, name), 'utf8'), '"./uniopc-chunk.js"')
+  }
+  assert.deepEqual(await rebrandCompiledRuntimePaths(root), [])
+  assert.deepEqual(await distSnapshot(root), after)
+})
+
+test('large dist rejects a late extra lifecycle suffix before any byte or filename changes', async t => {
+  const root = await largeDistFixture(t)
+  await writeFile(join(root, 'dist/zzzz-last-chunk.js'), 'const unsupported = "openclaw-state-locks";')
+  const before = await distSnapshot(root)
+  await assert.rejects(rebrandCompiledRuntimePaths(root), /Lifecycle coordinator/)
+  assert.deepEqual(await distSnapshot(root), before)
 })

@@ -123,7 +123,8 @@ export async function rebrandCompiledRuntimePaths(packageRoot) {
   }
   const textFiles = files.filter(path => /\.(?:js|mjs|cjs|ts|mts|json|html|css|map)$/i.test(path))
   // Preflight every role before writing or renaming any staged file.
-  const sources = await Promise.all(textFiles.map(async path => ({path, source: await readFile(path, 'utf8')})))
+  const sources = []
+  for (const path of textFiles) sources.push({path, source: await readFile(path, 'utf8')})
   const lifecycle = inspectLifecycleCoordinatorSources(sources.filter(entry => /\.[cm]?js$/i.test(entry.path)), {allowUnpatched: true})
   const lifecycleByPath = new Map(lifecycle.map(entry => [entry.path, entry]))
   const patches = []
