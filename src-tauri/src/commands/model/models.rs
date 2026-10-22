@@ -622,7 +622,7 @@ pub(super) mod implementation {
     }
 
     fn openclaw_agent_sqlite_path_for_profile(profile: Option<&str>) -> Result<PathBuf, String> {
-        Ok(openclaw_agent_dir_for_profile(profile)?.join("openclaw-agent.sqlite"))
+        Ok(openclaw_agent_dir_for_profile(profile)?.join(UNIOPC_AGENT_SQLITE_BASENAME))
     }
 
     fn official_codex_access_token() -> Option<String> {
@@ -1010,17 +1010,9 @@ pub(super) mod implementation {
         // `<provider>:default`.  A newly minted Uniopc token is a new credential,
         // so clear both representations.  Clearing only the latter left an inline
         // billing failure active for hours after the user had topped up credits.
-        let profile_id = format!("{provider_prefix}:default");
-        let inline_usage_id = format!("inline-api-key:{provider_prefix}");
-        let profile_json_path = openclaw_auth_usage_stats_json_path(&profile_id);
-        let inline_json_path = openclaw_auth_usage_stats_json_path(&inline_usage_id);
         let args = vec![
             db_path.to_string_lossy().to_string(),
-            format!(
-                "update auth_profile_state set state_json = json_remove(state_json, {}, {}), updated_at = cast(strftime('%s','now') as integer) * 1000 where state_key = 'primary';",
-                sqlite_string_literal(&profile_json_path),
-                sqlite_string_literal(&inline_json_path),
-            ),
+            openclaw_provider_auth_failure_state_sql(provider_prefix),
         ];
         command_output(app, "sqlite3", &args).await.map(|_| ())
     }

@@ -266,10 +266,10 @@ test('Windows cached archive verifier rejects missing/unpatched/duplicate/drifte
     const fixture=await nativeArchive(t,{source})
     await assert.rejects(verifyRuntimeDirectory(fixture.output),/exactly one|patch missing/)
   }
-  await writeFile(join(valid.engine,'dist/worker/worker.mjs'),workerSource(false)+'\n'+lifecycleWorkerFixture.replaceAll('openclaw-state-locks','uniopc-state-locks'))
+  await writeFile(join(valid.engine,'dist/worker/worker.mjs'),workerSource(false)+await generatedWorkerSuffix()+'\n'+lifecycleWorkerFixture.replaceAll('openclaw-state-locks','uniopc-state-locks'))
   execFileSync('tar',['-czf',join(valid.output,'uniopc-engine-runtime-win32-x64.tar.gz'),'-C',join(valid.root,'stage'),'tools'])
   await assert.rejects(verifyRuntimeDirectory(valid.output),/worker compatibility patch missing/)
-  await writeFile(join(valid.engine,'dist/worker/worker.mjs'),workerSource()+'\n'+lifecycleWorkerFixture.replaceAll('openclaw-state-locks','uniopc-state-locks'))
+  await writeFile(join(valid.engine,'dist/worker/worker.mjs'),workerSource()+await generatedWorkerSuffix()+'\n'+lifecycleWorkerFixture.replaceAll('openclaw-state-locks','uniopc-state-locks'))
   await writeFile(join(valid.engine,'dist/duplicate.js'),nativeSource(WINDOWS_NATIVE_REQUIRE_PATCHED))
   execFileSync('tar',['-czf',join(valid.output,'uniopc-engine-runtime-win32-x64.tar.gz'),'-C',join(valid.root,'stage'),'tools'])
   await assert.rejects(verifyRuntimeDirectory(valid.output),/exactly one/)
@@ -307,7 +307,7 @@ test('dual loader roles reject missing, duplicate, nested, string/comment worker
 test('standalone Windows archive verifier and VM uniqueness checks work without node_modules and never evaluate worker code', async t => {
   const fixture=await nativeArchive(t)
   const marker=join(fixture.root,'must-not-evaluate')
-  await writeFile(join(fixture.engine,'dist/worker/worker.mjs'),workerSource()+'\n'+lifecycleWorkerFixture.replaceAll('openclaw-state-locks','uniopc-state-locks')
+  await writeFile(join(fixture.engine,'dist/worker/worker.mjs'),workerSource()+await generatedWorkerSuffix()+'\n'+lifecycleWorkerFixture.replaceAll('openclaw-state-locks','uniopc-state-locks')
     +';fs.writeFileSync('+JSON.stringify(marker)+',"bad");throw new Error("must not evaluate");')
   execFileSync('tar',['-czf',join(fixture.output,'uniopc-engine-runtime-win32-x64.tar.gz'),'-C',join(fixture.root,'stage'),'tools'])
   const script=join(fixture.root,'verify.mjs')
@@ -324,7 +324,7 @@ test('standalone Windows archive verifier and VM uniqueness checks work without 
 
 test('Windows native archive collection accepts literal U+FFFD independently of branding readability', async t => {
   const fixture=await nativeArchive(t,{source:nativeSource(WINDOWS_NATIVE_REQUIRE_PATCHED)+'\nconst replacement="�";'})
-  await writeFile(join(fixture.engine,'dist/worker/worker.mjs'),workerSource()+'\n'+lifecycleWorkerFixture.replaceAll('openclaw-state-locks','uniopc-state-locks')+'\nconst replacement="�";')
+  await writeFile(join(fixture.engine,'dist/worker/worker.mjs'),workerSource()+await generatedWorkerSuffix()+'\n'+lifecycleWorkerFixture.replaceAll('openclaw-state-locks','uniopc-state-locks')+'\nconst replacement="�";')
   const repack=()=>execFileSync('tar',['-czf',join(fixture.output,'uniopc-engine-runtime-win32-x64.tar.gz'),'-C',join(fixture.root,'stage'),'tools'])
   repack()
   assert.equal((await verifyRuntimeDirectory(fixture.output)).artifactCount,1)
@@ -380,7 +380,7 @@ const lifecycleReadableFixture = "function resolveLifecycleCoordinatorPath(famil
 const lifecycleWorkerFixture = "function resolveLifecycleCoordinatorPath(Ot,Zt){let _n=resolvePathViaExistingAncestorSync(Zt.databasePath),Dn=resolvePathViaExistingAncestorSync(Zt.runtimeDirectory),kn=Zt.uid===void 0?`openclaw-state-locks`:`openclaw-state-locks-${Zt.uid}`;return path.join(Dn,kn,`${Ot}.${sha256HexPrefixCore(_n,8)}.lock.sqlite`)}"
 const lifecycleFixtures = [
   ['dist/state-database-coordinator-fixture.js', lifecycleReadableFixture],
-  ['dist/config-doctor/official-external-plugin-catalog-snapshot-store-fixture.js', lifecycleReadableFixture],
+  ['dist/config-doctor/official-external-plugin-catalog-snapshot-store-DAJ2jZEn.js', lifecycleReadableFixture],
   ['dist/worker/worker.mjs', lifecycleWorkerFixture],
 ]
 async function addLifecycleFixtures(root, branded = false) {
@@ -391,6 +391,7 @@ async function addLifecycleFixtures(root, branded = false) {
     try { existing = await readFile(path, 'utf8') } catch {}
     await writeFile(path, existing + '\n' + (branded ? body.replaceAll('openclaw-state-locks', 'uniopc-state-locks') : body))
   }
+  await addGeneratedStateFixtures(root, branded)
 }
 
 test('archive lifecycle gate rejects each unpatched role on every platform', async t => {
@@ -418,5 +419,57 @@ test('archive lifecycle gate rejects commented, string and nested fake helpers i
     await writeFile(path, (await readFile(path, 'utf8')).replace(branded, wrapper(branded)))
     execFileSync('tar', ['-czf', join(fixture.output, 'uniopc-engine-runtime-linux-x64.tar.gz'), '-C', join(fixture.root, 'stage'), 'tools'])
     await assert.rejects(verifyRuntimeDirectory(fixture.output), /Lifecycle coordinator.*(?:structure drift|top-level)/)
+  }
+})
+
+async function addGeneratedStateFixtures(root, branded = false) {
+  const {GENERATED_STATE_ROLES, GENERATED_STATE_FUNCTIONS, inspectGeneratedStateSources} = await import('./verify-uniopc-whitelabel-runtime.mjs')
+  const names=['openclaw-agent.sqlite','incognito-openclaw-agent.sqlite','openclaw.sqlite']
+  for(const {role,counts} of [...GENERATED_STATE_ROLES, ...[...new Set(GENERATED_STATE_FUNCTIONS.map(item=>item.role))].filter(role=>!GENERATED_STATE_ROLES.some(item=>item.role===role)).map(role=>({role,counts:[0,0,0]}))]) {
+    const file=join(root,'dist',role)
+    await mkdir(join(file,'..'),{recursive:true})
+    let source=''
+    try {source=await readFile(file,'utf8')} catch {}
+    for(const contract of GENERATED_STATE_FUNCTIONS.filter(item=>item.role===role)) source+='\n'+contract.body
+    if(role==='uniopc-cli-invocation-Dah1vX_Z.js') source+='\nconst OPENCLAW_CLI_ENTRY_BASENAMES = /* @__PURE__ */ new Set(["openclaw", "openclaw.mjs"]);'
+    if(role==='worker/worker.mjs') source+='\nvar OPENCLAW_CLI_ENTRY_BASENAMES=new Set([`openclaw`,`openclaw.mjs`]);'
+    if(role==='register.backup-BFONF7_5.js') source+='\nconst BACKUP_CRON_JOB_NAME = "openclaw-backup-scheduled";'
+    const present=names.map(name=>source.split(name).length-1);present[0]-=present[1]
+    for(let i=0;i<3;i++) for(let j=present[i];j<counts[i];j++) source+='\n// '+names[i]
+    await writeFile(file,source)
+  }
+  if(branded) {
+    const sources=[]
+    async function visit(dir) {for(const e of await readdir(dir,{withFileTypes:true})){const file=join(dir,e.name);if(e.isDirectory())await visit(file);else sources.push({path:file,source:await readFile(file,'utf8')})}}
+    await visit(join(root,'dist'))
+    for(const [file,source] of inspectGeneratedStateSources(sources,{allowUnpatched:true})) await writeFile(file,source)
+  }
+}
+
+async function generatedWorkerSuffix() {
+  const root=await mkdtemp(join(tmpdir(),'uniopc-worker-fixture-'))
+  try {
+    await addGeneratedStateFixtures(root,true)
+    return '\n'+await readFile(join(root,'dist/worker/worker.mjs'),'utf8')
+  } finally {await rm(root,{recursive:true,force:true})}
+}
+
+test('archive gate audits plugin root display names and all generated state text roles', async t => {
+  const fixture=await nativeArchive(t,{platform:'linux'})
+  const manifest=join(fixture.engine,'dist','uniopc.plugin.json')
+  const repack=()=>execFileSync('tar',['-czf',join(fixture.output,'uniopc-engine-runtime-linux-x64.tar.gz'),'-C',join(fixture.root,'stage'),'tools'])
+  await writeFile(manifest,JSON.stringify({name:'OpenClaw Memory',id:'openclaw-memory',cliCommands:[{name:'OpenClaw'}]}))
+  repack()
+  await assert.rejects(verifyRuntimeDirectory(fixture.output),/Unbranded runtime text/)
+  for(const name of ['Uniopc Memory','@openclaw/foo','openclaw-memory']) {
+    await writeFile(manifest,JSON.stringify({name,id:'openclaw-memory',cliCommands:[{name:'OpenClaw'}]}))
+    repack()
+    assert.equal((await verifyRuntimeDirectory(fixture.output)).artifactCount,1)
+  }
+  const extra=join(fixture.engine,'dist','unknown-state.txt')
+  for(const basename of ['openclaw.sqlite','uniopc-agent.sqlite']) {
+    await writeFile(extra,basename)
+    repack()
+    await assert.rejects(verifyRuntimeDirectory(fixture.output),/Generated state unknown basename role/)
   }
 })

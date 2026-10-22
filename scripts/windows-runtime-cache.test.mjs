@@ -9,6 +9,29 @@ import { runtimeCacheKey, runtimeProjection, parserLockClosure, moduleImports, l
 import { OPENCLAW_RELEASE_NODE_VERSION } from './verify-openclaw-release-contract.mjs'
 import { LIFECYCLE_PATH_READABLE_ORIGINAL, LIFECYCLE_PATH_WORKER_ORIGINAL } from './verify-uniopc-whitelabel-runtime.mjs'
 const sourceRoot = resolve(import.meta.dirname, '..')
+async function addGeneratedStateFixtures(root, branded = false) {
+  const {GENERATED_STATE_ROLES, GENERATED_STATE_FUNCTIONS, inspectGeneratedStateSources} = await import('./verify-uniopc-whitelabel-runtime.mjs')
+  const names=['openclaw-agent.sqlite','incognito-openclaw-agent.sqlite','openclaw.sqlite']
+  for(const {role,counts} of [...GENERATED_STATE_ROLES, ...[...new Set(GENERATED_STATE_FUNCTIONS.map(item=>item.role))].filter(role=>!GENERATED_STATE_ROLES.some(item=>item.role===role)).map(role=>({role,counts:[0,0,0]}))]) {
+    const file=join(root,'dist',role)
+    await mkdir(join(file,'..'),{recursive:true})
+    let source=''
+    try {source=await readFile(file,'utf8')} catch {}
+    for(const contract of GENERATED_STATE_FUNCTIONS.filter(item=>item.role===role)) source+='\n'+contract.body
+    if(role==='uniopc-cli-invocation-Dah1vX_Z.js') source+='\nconst OPENCLAW_CLI_ENTRY_BASENAMES = /* @__PURE__ */ new Set(["openclaw", "openclaw.mjs"]);'
+    if(role==='worker/worker.mjs') source+='\nvar OPENCLAW_CLI_ENTRY_BASENAMES=new Set([`openclaw`,`openclaw.mjs`]);'
+    if(role==='register.backup-BFONF7_5.js') source+='\nconst BACKUP_CRON_JOB_NAME = "openclaw-backup-scheduled";'
+    const present=names.map(name=>source.split(name).length-1);present[0]-=present[1]
+    for(let i=0;i<3;i++) for(let j=present[i];j<counts[i];j++) source+='\n// '+names[i]
+    await writeFile(file,source)
+  }
+  if(branded) {
+    const sources=[]
+    async function visit(dir) {for(const e of await readdir(dir,{withFileTypes:true})){const file=join(dir,e.name);if(e.isDirectory())await visit(file);else sources.push({path:file,source:await readFile(file,'utf8')})}}
+    await visit(join(root,'dist'))
+    for(const [file,source] of inspectGeneratedStateSources(sources,{allowUnpatched:true})) await writeFile(file,source)
+  }
+}
 async function fixture(t) {
   const root = await mkdtemp(join(tmpdir(), 'uniopc-cache-'))
   t.after(() => rm(root, { recursive: true, force: true }))
@@ -155,10 +178,11 @@ test('actual cache key, seed-key and verifier CLIs load in an isolated repo befo
   const engine=resolve(stage,'../../..')
   const lifecycleFixtures=[
     ['dist/state-database-coordinator-fixture.js',LIFECYCLE_PATH_READABLE_ORIGINAL],
-    ['dist/config-doctor/official-external-plugin-catalog-snapshot-store-fixture.js',LIFECYCLE_PATH_READABLE_ORIGINAL],
+    ['dist/config-doctor/official-external-plugin-catalog-snapshot-store-DAJ2jZEn.js',LIFECYCLE_PATH_READABLE_ORIGINAL],
     ['dist/worker/worker.mjs',LIFECYCLE_PATH_WORKER_ORIGINAL],
   ]
   for(const [file,original] of lifecycleFixtures){const path=join(engine,file);await mkdir(dirname(path),{recursive:true});await writeFile(path,original.replaceAll('openclaw-state-locks','uniopc-state-locks'))}
+  await addGeneratedStateFixtures(engine, true)
   execFileSync('tar',['-czf',join(runtime,'uniopc-engine-runtime-darwin-x64.tar.gz'),'-C',join(root,'verifier-stage'),'tools'])
   await writeFile(join(runtime,'uniopc-engine-runtime.catalog.json'),JSON.stringify({artifacts:[{platform:'darwin',arch:'x64',archive:'uniopc-engine-runtime-darwin-x64.tar.gz'}]}))
   assert.match(run('verify-uniopc-whitelabel-runtime.mjs',[runtime]),/branding verified \(1 artifact\(s\)\)/)

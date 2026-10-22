@@ -4027,6 +4027,8 @@ fn local_host_name() -> String {
         .unwrap_or_else(|| "owner-computer".to_string())
 }
 
+const UNIOPC_AGENT_SQLITE_BASENAME: &str = "uniopc-agent.sqlite";
+
 fn openclaw_agent_dir_for_profile(profile: Option<&str>) -> Result<PathBuf, String> {
     let config_path = openclaw_gateway::openclaw_config_path_for_profile(profile)?;
     let profile_dir = config_path
@@ -4059,11 +4061,15 @@ pub(crate) fn repair_openclaw_assistant_attachment_blocks(
     profile: Option<&str>,
 ) -> Result<usize, String> {
     let database_path =
-        openclaw_agent_dir_for_profile(profile)?.join("openclaw-agent.sqlite");
+        openclaw_agent_dir_for_profile(profile)?.join(UNIOPC_AGENT_SQLITE_BASENAME);
+    repair_openclaw_assistant_attachment_blocks_at_path(&database_path)
+}
+
+fn repair_openclaw_assistant_attachment_blocks_at_path(database_path: &Path) -> Result<usize, String> {
     if !database_path.is_file() {
         return Ok(0);
     }
-    let connection = Connection::open(&database_path)
+    let connection = Connection::open(database_path)
         .map_err(|error| format!("open transcript database: {error}"))?;
     let mut statement = connection
         .prepare(
@@ -4104,6 +4110,18 @@ pub(crate) fn repair_openclaw_assistant_attachment_blocks(
         repaired += 1;
     }
     Ok(repaired)
+}
+
+fn openclaw_provider_auth_failure_state_sql(provider_prefix: &str) -> String {
+    let profile_id = format!("{provider_prefix}:default");
+    let inline_usage_id = format!("inline-api-key:{provider_prefix}");
+    let profile_json_path = openclaw_auth_usage_stats_json_path(&profile_id);
+    let inline_json_path = openclaw_auth_usage_stats_json_path(&inline_usage_id);
+    format!(
+        "update auth_profile_state set state_json = json_remove(state_json, {}, {}), updated_at = cast(strftime('%s','now') as integer) * 1000 where state_key = 'primary';",
+        sqlite_string_literal(&profile_json_path),
+        sqlite_string_literal(&inline_json_path),
+    )
 }
 
 fn openclaw_auth_usage_stats_json_path(profile_id: &str) -> String {
@@ -8966,6 +8984,55 @@ mod tests {
 
         let escaped = sqlite_string_literal("owner's profile");
         assert_eq!(escaped, "'owner''s profile'");
+    }
+
+    #[test]
+    fn generated_agent_database_fixture_repairs_and_reopens_branded_file() {
+        let root =
+            std::env::temp_dir().join(format!("uniopc-generated-agent-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join(UNIOPC_AGENT_SQLITE_BASENAME);
+        let old_path = root.join("openclaw-agent.sqlite");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch("CREATE TABLE transcript_events (session_id TEXT, seq INTEGER, event_json TEXT); CREATE TABLE auth_profile_state (state_key TEXT, state_json TEXT, updated_at INTEGER);").unwrap();
+        connection.execute("INSERT INTO transcript_events VALUES ('fixture', 1, ?1)", [r#"{"message":{"role":"assistant","content":[{"type":"text","text":"keep"},{"type":"attachment","attachment":{"name":"fixture"}}]}}"#]).unwrap();
+        connection.execute("INSERT INTO auth_profile_state VALUES ('primary', ?1, 0)", [r#"{"usageStats":{"uniopc-official:default":{"disabledUntil":123},"inline-api-key:uniopc-official":{"disabledUntil":123},"other:default":{"keep":true}}}"#]).unwrap();
+        drop(connection);
+        assert_eq!(
+            repair_openclaw_assistant_attachment_blocks_at_path(&path).unwrap(),
+            1
+        );
+        let connection = Connection::open(&path).unwrap();
+        let event: String = connection
+            .query_row("SELECT event_json FROM transcript_events", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&event)
+                .unwrap()
+                .pointer("/message/content")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        connection
+            .execute_batch(&openclaw_provider_auth_failure_state_sql("uniopc-official"))
+            .unwrap();
+        let state: String = connection
+            .query_row("SELECT state_json FROM auth_profile_state", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&state).unwrap(),
+            serde_json::json!({"usageStats":{"other:default":{"keep":true}}})
+        );
+        drop(connection);
+        assert!(!old_path.exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

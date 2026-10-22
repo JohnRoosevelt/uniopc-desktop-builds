@@ -1,4 +1,4 @@
-import { inspectLifecycleCoordinatorSources } from './verify-uniopc-whitelabel-runtime.mjs'
+import { isTechnicalPackageName, inspectGeneratedStateSources, inspectLifecycleCoordinatorSources } from './verify-uniopc-whitelabel-runtime.mjs'
 import { isManagedSkillMarkdown, rebrandSkillMarkdown } from './uniopc-skill-branding.mjs'
 import { readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
 import { basename, join, relative } from 'node:path'
@@ -45,7 +45,7 @@ export async function retainRuntimeWorkspaceTemplates(packageRoot) {
   }
 }
 
-export function rebrandDisplayMetadata(value, { browserManifest = false, cliHelp = false, key = '' } = {}) {
+export function rebrandDisplayMetadata(value, { browserManifest = false, pluginManifest = false, cliHelp = false, key = '' } = {}) {
   if (typeof value === 'string') {
     if (cliHelp || /^(?:browser|secrets|nodes|root)HelpText$/.test(key)) return rebrandCliHelpText(value)
     if (DISPLAY_KEYS.has(key) || (browserManifest && key === 'name')) return rebrandVisibleText(value)
@@ -55,7 +55,7 @@ export function rebrandDisplayMetadata(value, { browserManifest = false, cliHelp
   if (!value || typeof value !== 'object') return value
   return Object.fromEntries(Object.entries(value).map(([childKey, child]) => [
     childKey,
-    rebrandDisplayMetadata(child, { browserManifest, cliHelp: cliHelp || childKey === 'subcommandHelpText', key: childKey }),
+    pluginManifest && childKey === 'name' && typeof child === 'string' && !isTechnicalPackageName(child) ? rebrandVisibleText(child) : rebrandDisplayMetadata(child, { browserManifest, cliHelp: cliHelp || childKey === 'subcommandHelpText', key: childKey }),
   ]))
 }
 
@@ -94,7 +94,7 @@ export async function rebrandRuntimeTree(packageRoot) {
     let parsed
     try { parsed = JSON.parse(before) } catch { return }
     const browserManifest = /dist\/extensions\/browser\/chrome-extension\/manifest\.json$/i.test(path)
-    const transformed = rebrandDisplayMetadata(parsed, { browserManifest })
+    const transformed = rebrandDisplayMetadata(parsed, { browserManifest, pluginManifest: /(?:^|[\\/])(?:openclaw|uniopc)\.plugin\.json$/.test(path) })
     if (JSON.stringify(transformed) === JSON.stringify(parsed)) return
     const after = `${JSON.stringify(transformed, null, 2)}\n`
     if (after !== before) {
@@ -121,17 +121,20 @@ export async function rebrandCompiledRuntimePaths(packageRoot) {
     if (files.includes(join(path, '..', branded))) throw new Error(`Runtime chunk rename collision: ${rel}`)
     changes.set(path, { rel, basename, branded })
   }
-  const textFiles = files.filter(path => /\.(?:js|mjs|cjs|ts|mts|json|html|css|map)$/i.test(path))
+  const textFiles = files.filter(path => /\.(?:js|mjs|cjs|ts|mts|json|html|css|map|txt|xml|yaml|yml|toml|md)$/i.test(path))
   // Preflight every role before writing or renaming any staged file.
   const sources = []
   for (const path of textFiles) sources.push({path, source: await readFile(path, 'utf8')})
   const lifecycle = inspectLifecycleCoordinatorSources(sources.filter(entry => /\.[cm]?js$/i.test(entry.path)), {allowUnpatched: true})
+  const generatedState = inspectGeneratedStateSources(sources, {allowUnpatched: true})
   const lifecycleByPath = new Map(lifecycle.map(entry => [entry.path, entry]))
   const patches = []
   let lockPathMatches = 0
   for (const {path, source: before} of sources) {
     const coordinator = lifecycleByPath.get(path)
-    let after = coordinator ? before.slice(0, coordinator.start) + coordinator.patchedBody + before.slice(coordinator.start + coordinator.body.length) : before
+    // Apply independent preflighted patches before chunk references change.
+    const generated = generatedState.get(path)
+    let after = coordinator ? generated.replace(coordinator.body, coordinator.patchedBody) : generated
     for (const { basename, branded } of changes.values()) after = after.replaceAll(basename, branded)
     if (/\/paths-[^/]+\.js$/i.test(path.replaceAll('\\', '/'))) {
       const legacy = '`openclaw-${uid}` : "openclaw"'

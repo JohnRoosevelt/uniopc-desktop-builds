@@ -57,7 +57,12 @@ import { inspectWindowsNativeRequireSources, verifyRuntimeDirectory } from './ve
 
 import { OPENCLAW_RELEASE_NODE_VERSION } from './verify-openclaw-release-contract.mjs'
 
-const INSTALL_SCRIPT_URL = 'https://openclaw.ai/install-cli.sh'
+// Installer policy is part of the pinned engine contract, not a rolling input.
+const UNIX_INSTALLER_CONTRACT = Object.freeze({
+  engineVersion: '2026.8.1',
+  url: 'https://raw.githubusercontent.com/openclaw/openclaw/ea806575e6450e4d1efdfc72c19f04be982a1b9b/scripts/install-cli.sh',
+  sha256: '66a719b8e3fffbac45763e267f37d49e87ee5d282a606e74f55b2721f1322f94',
+})
 const OUTPUT_DIR = resolve('src-tauri/resources/uniopc-engine-runtime')
 const RUNTIME_CATALOG_FILE = 'uniopc-engine-runtime.catalog.json'
 const SUPPORTED_RUNTIME_TARGETS = new Set([
@@ -196,19 +201,26 @@ async function downloadFile(url, destPath, { label } = {}) {
   return destPath
 }
 
-async function downloadInstallScript(destPath) {
-  await downloadFile(INSTALL_SCRIPT_URL, destPath)
-  const body = await readFile(destPath, 'utf8')
-  if (!body.includes('openclaw')) {
-    throw new Error('Downloaded install script does not look like the OpenClaw installer')
+async function downloadInstallScript(destPath, version) {
+  if (version !== UNIX_INSTALLER_CONTRACT.engineVersion) {
+    throw new Error(`No pinned Unix installer contract for OpenClaw ${version}`)
+  }
+  await downloadFile(UNIX_INSTALLER_CONTRACT.url, destPath)
+  const body = await readFile(destPath)
+  const digest = createHash('sha256').update(body).digest('hex')
+  if (digest !== UNIX_INSTALLER_CONTRACT.sha256) {
+    throw new Error('Downloaded Unix installer SHA-256 does not match the pinned contract')
+  }
+  if (!/^#!\/.*\b(?:bash|sh)\b/.test(body.toString('utf8')) || !body.includes('openclaw')) {
+    throw new Error('Downloaded install script does not look like the OpenClaw shell installer')
   }
   return destPath
 }
 
-async function stageOfficialInstall({ version, stagingRoot }) {
+export async function stageOfficialInstall({ version, stagingRoot }) {
   const prefix = join(stagingRoot, 'openclaw-prefix')
   const scriptPath = join(stagingRoot, 'install-cli.sh')
-  await downloadInstallScript(scriptPath)
+  await downloadInstallScript(scriptPath, version)
   await runCommand(
     'bash',
     [

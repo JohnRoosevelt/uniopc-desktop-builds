@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict'
-import { execFileSync } from 'node:child_process'
+import childProcess, { execFileSync } from 'node:child_process'
+import { EventEmitter } from 'node:events'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { readFile } from 'node:fs/promises'
 import test from 'node:test'
-import Module, { createRequire, stripTypeScriptTypes } from 'node:module'
+import Module, { createRequire, stripTypeScriptTypes, syncBuiltinESMExports } from 'node:module'
 import { pathToFileURL } from 'node:url'
 import { WINDOWS_NATIVE_REQUIRE_ORIGINAL, WINDOWS_NATIVE_REQUIRE_PATCHED, WINDOWS_WORKER_NATIVE_REQUIRE_ORIGINAL, WINDOWS_WORKER_NATIVE_REQUIRE_PATCHED } from './verify-uniopc-whitelabel-runtime.mjs'
 
@@ -660,4 +661,65 @@ test('worker native loader records native hits without fallback and preserves re
   assert.deepEqual(loader.tryNativeRequireJavaScriptModule(pathToFileURL(tla).href,{allowWindows:true}),{ok:false})
   assert.equal((await import(pathToFileURL(tla).href)).value,23)
   delete globalThis[key]
+})
+
+
+test('Unix installer contract verifies pinned bytes before bash and rejects unsupported input without execution', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'uniopc-installer-contract-'))
+  t.after(() => rmSync(root, {recursive: true, force: true}))
+  const source = await readFile(new URL('./build-openclaw-runtime-bundle.mjs', import.meta.url), 'utf8')
+  const expectedDigest = '66a719b8e3fffbac45763e267f37d49e87ee5d282a606e74f55b2721f1322f94'
+  const installerUrl = 'https://raw.githubusercontent.com/openclaw/openclaw/ea806575e6450e4d1efdfc72c19f04be982a1b9b/scripts/install-cli.sh'
+  assert.ok(source.includes(`sha256: '${expectedDigest}'`))
+  assert.ok(source.includes(`url: '${installerUrl}'`))
+  const shell = Buffer.from('#!/bin/bash\n# openclaw synthetic installer\n')
+  // These expected digests belong to fixed test fixtures, never downloaded bytes.
+  const shellDigest = 'c483b25cf075fa3e6869ea27b818b0fae71f63a874a6c53787fae52761f29e74'
+  const nonShellDigest = 'f70c581418dc85045980b4b6aa9fd163159bf3790c241ffa468b3f75b98667ba'
+  let body = shell
+  const calls = []
+  t.mock.method(childProcess, 'spawn', (command, args) => {
+    calls.push({command, args})
+    const child = new EventEmitter()
+    if (command === 'curl') writeFileSync(args[args.indexOf('-o') + 1], body)
+    else assert.equal(command, 'bash', 'unexpected command in installer staging')
+    queueMicrotask(() => child.emit('exit', 0))
+    return child
+  })
+  syncBuiltinESMExports()
+  t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports() })
+  let fixtureIndex = 0
+  async function installerWithDigest(digest) {
+    const modulePath = join(root, `builder-${fixtureIndex++}.mjs`)
+    // Keep the actual staging/validation path; only substitute the fixture's
+    // predeclared contract digest so the test needs neither network nor Git.
+    const fixtureSource = source.replace(expectedDigest, digest)
+      .replace(/from '(\.\/[^']+)'/g, (_, relative) => `from '${new URL(relative, import.meta.url).href}'`)
+    writeFileSync(modulePath, fixtureSource)
+    return (await import(pathToFileURL(modulePath).href)).stageOfficialInstall
+  }
+  const stage = await installerWithDigest(shellDigest)
+  const prefix = await stage({version: '2026.8.1', stagingRoot: root})
+  assert.equal(prefix, join(root, 'openclaw-prefix'))
+  assert.deepEqual(calls.map(call => call.command), ['curl', 'bash'])
+  assert.deepEqual(calls[0].args, ['-fsSL', '--proto', '=https', '--tlsv1.2', '-o', join(root, 'install-cli.sh'), installerUrl])
+  assert.deepEqual(calls[1].args, [join(root, 'install-cli.sh'), '--json', '--no-onboard', '--prefix', prefix, '--version', '2026.8.1', '--node-version', '24.19.0'])
+  calls.length = 0
+  body = Buffer.from(shell)
+  body[body.length - 1] ^= 1
+  await assert.rejects(stage({version: '2026.8.1', stagingRoot: root}), /SHA-256/)
+  assert.deepEqual(calls.map(call => call.command), ['curl'])
+  calls.length = 0
+  body = shell
+  const wrongDigest = await installerWithDigest('0'.repeat(64))
+  await assert.rejects(wrongDigest({version: '2026.8.1', stagingRoot: root}), /SHA-256/)
+  assert.deepEqual(calls.map(call => call.command), ['curl'])
+  calls.length = 0
+  body = Buffer.from('openclaw is not a shell script\n')
+  const nonShell = await installerWithDigest(nonShellDigest)
+  await assert.rejects(nonShell({version: '2026.8.1', stagingRoot: root}), /shell installer/)
+  assert.deepEqual(calls.map(call => call.command), ['curl'])
+  calls.length = 0
+  await assert.rejects(stage({version: '2026.8.2', stagingRoot: root}), /No pinned Unix installer contract/)
+  assert.deepEqual(calls, [])
 })

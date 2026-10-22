@@ -128,7 +128,7 @@ const lifecycleReadableFixture = "function resolveLifecycleCoordinatorPath(famil
 const lifecycleWorkerFixture = "function resolveLifecycleCoordinatorPath(Ot,Zt){let _n=resolvePathViaExistingAncestorSync(Zt.databasePath),Dn=resolvePathViaExistingAncestorSync(Zt.runtimeDirectory),kn=Zt.uid===void 0?`openclaw-state-locks`:`openclaw-state-locks-${Zt.uid}`;return path.join(Dn,kn,`${Ot}.${sha256HexPrefixCore(_n,8)}.lock.sqlite`)}"
 const lifecycleFixtures = [
   ['dist/state-database-coordinator-fixture.js', lifecycleReadableFixture],
-  ['dist/config-doctor/official-external-plugin-catalog-snapshot-store-fixture.js', lifecycleReadableFixture],
+  ['dist/config-doctor/official-external-plugin-catalog-snapshot-store-DAJ2jZEn.js', lifecycleReadableFixture],
   ['dist/worker/worker.mjs', lifecycleWorkerFixture],
 ]
 async function addLifecycleFixtures(root, branded = false) {
@@ -139,6 +139,7 @@ async function addLifecycleFixtures(root, branded = false) {
     try { existing = await readFile(path, 'utf8') } catch {}
     await writeFile(path, existing + '\n' + (branded ? body.replaceAll('openclaw-state-locks', 'uniopc-state-locks') : body))
   }
+  await addGeneratedStateFixtures(root, branded)
 }
 
 test('lifecycle preflight rejects missing, duplicate, drifted and extra legacy suffixes without writes', async t => {
@@ -222,7 +223,7 @@ async function distSnapshot(root) {
 function transformWithLowFdLimit(moduleUrl, root) {
   const program = `import { rebrandCompiledRuntimePaths } from ${JSON.stringify(moduleUrl)};
 try { await rebrandCompiledRuntimePaths(process.argv[1]); }
-catch (error) { console.error(error.code || error.message); process.exitCode = 1; }`
+catch (error) { console.error(error.stack || error.message); process.exitCode = 1; }`
   // Positional arguments avoid shell interpolation of paths or source code.
   return spawnSync('/bin/sh', ['-c', 'ulimit -n 64 || exit 90; exec "$@"', 'fd-limit-test',
     process.execPath, '--input-type=module', '-e', program, root], {encoding: 'utf8', timeout: 60000})
@@ -272,4 +273,309 @@ test('large dist rejects a late extra lifecycle suffix before any byte or filena
   const before = await distSnapshot(root)
   await assert.rejects(rebrandCompiledRuntimePaths(root), /Lifecycle coordinator/)
   assert.deepEqual(await distSnapshot(root), before)
+})
+
+async function addGeneratedStateFixtures(root, branded = false) {
+  const {GENERATED_STATE_ROLES, GENERATED_STATE_FUNCTIONS, inspectGeneratedStateSources} = await import('./verify-uniopc-whitelabel-runtime.mjs')
+  const names=['openclaw-agent.sqlite','incognito-openclaw-agent.sqlite','openclaw.sqlite']
+  for(const {role,counts} of [...GENERATED_STATE_ROLES, ...[...new Set(GENERATED_STATE_FUNCTIONS.map(item=>item.role))].filter(role=>!GENERATED_STATE_ROLES.some(item=>item.role===role)).map(role=>({role,counts:[0,0,0]}))]) {
+    const file=join(root,'dist',role)
+    await mkdir(join(file,'..'),{recursive:true})
+    let source=''
+    try {source=await readFile(file,'utf8')} catch {}
+    for(const contract of GENERATED_STATE_FUNCTIONS.filter(item=>item.role===role)) source+='\n'+contract.body
+    if(role==='uniopc-cli-invocation-Dah1vX_Z.js') source+='\nconst OPENCLAW_CLI_ENTRY_BASENAMES = /* @__PURE__ */ new Set(["openclaw", "openclaw.mjs"]);'
+    if(role==='worker/worker.mjs') source+='\nvar OPENCLAW_CLI_ENTRY_BASENAMES=new Set([`openclaw`,`openclaw.mjs`]);'
+    if(role==='register.backup-BFONF7_5.js') source+='\nconst BACKUP_CRON_JOB_NAME = "openclaw-backup-scheduled";'
+    const present=names.map(name=>source.split(name).length-1);present[0]-=present[1]
+    for(let i=0;i<3;i++) for(let j=present[i];j<counts[i];j++) source+='\n// '+names[i]
+    await writeFile(file,source)
+  }
+  if(branded) {
+    const sources=[]
+    async function visit(dir) {for(const e of await readdir(dir,{withFileTypes:true})){const file=join(dir,e.name);if(e.isDirectory())await visit(file);else sources.push({path:file,source:await readFile(file,'utf8')})}}
+    await visit(join(root,'dist'))
+    for(const [file,source] of inspectGeneratedStateSources(sources,{allowUnpatched:true})) await writeFile(file,source)
+  }
+}
+
+test('plugin manifest root display name preserves package identities and nested commands', () => {
+  const input={name:'OpenClaw Memory',id:'openclaw-memory',cliCommands:[{name:'OpenClaw',description:'OpenClaw help'}]}
+  assert.deepEqual(rebrandDisplayMetadata(input,{pluginManifest:true}),{name:'Uniopc Memory',id:'openclaw-memory',cliCommands:[{name:'OpenClaw',description:'Uniopc help'}]})
+  for(const name of ['@openclaw/foo','openclaw','openclaw-memory']) {
+    assert.equal(rebrandDisplayMetadata({name},{pluginManifest:true}).name,name)
+    assert.equal(rebrandDisplayMetadata({name},{}).name,name)
+  }
+  assert.equal(rebrandDisplayMetadata({name:'OpenClaw Memory'}).name,'OpenClaw Memory')
+})
+
+test('actual pinned engine converts all generated state roles atomically and runs its technical CLI', {skip:!process.env.LAN46_ENGINE_SOURCE, timeout:600000}, async t => {
+  const {cp,rename}=await import('node:fs/promises')
+  const {inspectGeneratedStateSources}=await import('./verify-uniopc-whitelabel-runtime.mjs')
+  const root=await mkdtemp(join(tmpdir(),'uniopc-real-generated-state-'))
+  t.after(()=>rm(root,{recursive:true,force:true}))
+  const engine=join(root,'uniopc-engine')
+  await cp(process.env.LAN46_ENGINE_SOURCE,engine,{recursive:true})
+  const entries=[]
+  async function visit(dir) {for(const e of await readdir(dir,{withFileTypes:true})){const file=join(dir,e.name);if(e.isDirectory())await visit(file);else if(/\.(?:js|mjs|cjs|ts|mts|json|html|css|map)$/.test(file))entries.push({path:file,source:await readFile(file,'utf8')})}}
+  await visit(join(engine,'dist'))
+  assert.equal(inspectGeneratedStateSources(entries,{allowUnpatched:true}).size,entries.length)
+  const original=await distSnapshot(engine)
+  const worker=join(engine,'dist/worker/worker.mjs')
+  const workerBefore=await readFile(worker,'utf8')
+  const invocation=entries.find(e=>/\/uniopc-cli-invocation-[^/]+\.js$/.test(e.path))
+  const session=entries.find(e=>/\/session-sqlite-target-[^/]+\.js$/.test(e.path))
+  const main=entries.find(e=>/\/uniopc-state-db-[^-]+\.js$/.test(e.path))
+  for(const variant of ['missing','duplicate','partial','count','unknown-old','unknown-new','cli','session','backup-partial','backup-unknown','escaped-drift','escaped-unknown']) {
+    const before=await distSnapshot(engine)
+    let restore
+    if(variant==='missing'){await rename(main.path,main.path+'.hidden');restore=()=>rename(main.path+'.hidden',main.path)}
+    if(variant==='duplicate'){const file=main.path.replace(/-[^-]+\.js$/,'-duplicate.js');await writeFile(file,main.source);restore=()=>rm(file)}
+    if(variant==='partial'||variant==='count'){await writeFile(worker,workerBefore.replace('openclaw-agent.sqlite',variant==='partial'?'uniopc-agent.sqlite':'other-agent.sqlite'));restore=()=>writeFile(worker,workerBefore)}
+    if(variant.startsWith('unknown-')){const file=join(engine,'dist/zz-unknown.json');await writeFile(file,JSON.stringify({file:variant==='unknown-old'?'openclaw.sqlite':'uniopc.sqlite'}));restore=()=>rm(file)}
+    if(variant==='cli'){await writeFile(invocation.path,invocation.source.replace('const sourceEntry =','const sourceEntryDrift ='));restore=()=>writeFile(invocation.path,invocation.source)}
+    if(variant==='session'){await writeFile(session.path,session.source.replace('|| "openclaw-agent"','|| "other-agent"'));restore=()=>writeFile(session.path,session.source)}
+    if(variant==='backup-partial'){await writeFile(worker,workerBefore.replace('-openclaw-backup`','-uniopc-backup`'));restore=()=>writeFile(worker,workerBefore)}
+    if(variant==='backup-unknown'||variant==='escaped-unknown'){const file=join(engine,'dist/unknown-generated.txt');await writeFile(file,variant==='backup-unknown'?'unexpected-uniopc-backup':'uniopc-agent\\.sqlite');restore=()=>rm(file)}
+    if(variant==='escaped-drift'){const file=join(engine,'dist/backup-archive-path-policy-DKQb_csh.js'),source=await readFile(file,'utf8');await writeFile(file,source.replace('(?:-wal|-shm|-journal)?','(?:-wal|-shm)?'));restore=()=>writeFile(file,source)}
+    const malformed=await distSnapshot(engine)
+    await assert.rejects(rebrandCompiledRuntimePaths(engine),/Generated state|Backup output/)
+    assert.deepEqual(await distSnapshot(engine),malformed,variant+' made zero byte/name writes')
+    await restore()
+    assert.deepEqual(await distSnapshot(engine),before)
+  }
+  await rebrandCompiledRuntimePaths(engine)
+  const converted=await distSnapshot(engine)
+  assert.notDeepEqual(converted,original)
+  await rebrandCompiledRuntimePaths(engine)
+  assert.deepEqual(await distSnapshot(engine),converted)
+  const patchedWorker=await readFile(worker,'utf8')
+  const technicalSet='new Set([`openclaw`,`openclaw.mjs`])'
+  assert.ok(workerBefore.split(technicalSet).length-1>1,'real worker includes an unrelated identical technical Set')
+  assert.equal(patchedWorker.split(technicalSet).length,workerBefore.split(technicalSet).length-1)
+  assert.equal(patchedWorker.split('openclaw-agent').length-1,workerBefore.split('openclaw-agent').length-1-31-1-1-1-1) // DBs, escaped validator, default and CLI temp prefix only
+  const program=`
+import assert from 'node:assert/strict';
+import {pathToFileURL} from 'node:url';
+import {readdirSync,existsSync,mkdirSync,readFileSync,writeFileSync} from 'node:fs';
+import path from 'node:path';
+import {execFileSync,spawnSync,spawn} from 'node:child_process';
+import {once} from 'node:events';
+import {createHash} from 'node:crypto';
+const engine=process.argv[1], state=process.argv[2];
+process.env.OPENCLAW_STATE_DIR=state;
+process.env.HOME=path.dirname(state);
+const modules={'uniopc-agent-db.paths':'uniopc-agent-db.paths-BAQb87PB.js','uniopc-state-db-readonly':'uniopc-state-db-readonly-YhcJ4nbp.js','session-sqlite-target':'session-sqlite-target-Cc4hugKW.js','uniopc-agent-db':'uniopc-agent-db-DwEkomYQ.js','state-database-coordinator':'state-database-coordinator-Dscslso6.js','uniopc-cli-invocation':'uniopc-cli-invocation-Dah1vX_Z.js','uniopc-cli-shim':'uniopc-cli-shim-BECwG_UE.js'};
+const load=async stem=>import(pathToFileURL(path.join(engine,'dist',modules[stem])));
+const paths=await load('uniopc-agent-db.paths');
+const shared=await load('uniopc-state-db-readonly');
+const sessions=await load('session-sqlite-target');
+const env={...process.env,OPENCLAW_STATE_DIR:state};
+const agent=paths.r({agentId:'main',env});
+assert.equal(agent,path.join(state,'agents/main/agent/uniopc-agent.sqlite'));
+assert.equal(paths.n({agentId:'main',env}),path.join(path.dirname(agent),'incognito-uniopc-agent.sqlite'));
+assert.equal(shared.J(env),path.join(state,'state/uniopc.sqlite'));
+assert.equal(sessions.i(path.join(state,'agents/main/sessions/sessions.json')).path,agent);
+const custom=path.join(state,'custom.sqlite');
+assert.equal(paths.r({agentId:'main',env,path:custom}),custom);
+assert.equal(sessions.i(custom).path,custom);
+const agentDb=await load('uniopc-agent-db');
+const open=agentDb.g({agentId:'main',env});
+open.db.prepare('INSERT INTO auth_profile_state VALUES (?,?,?)').run('fixture',JSON.stringify({token:'fixture-token'}),1);
+open.db.prepare('INSERT INTO session_nodes (session_key,current_session_id,entry_json,updated_at) VALUES (?,?,?,?)').run('agent:main:fixture','fixture-session','{}',1);
+open.db.prepare('INSERT INTO session_windows (session_id,session_key,created_at,updated_at) VALUES (?,?,?,?)').run('fixture-session','agent:main:fixture',1,1);
+open.db.prepare('INSERT INTO transcript_events VALUES (?,?,?,?)').run('fixture-session',1,JSON.stringify({message:{role:'user',content:'fixture-message'}}),1);
+assert.ok(existsSync(agent+'-wal'));assert.ok(existsSync(agent+'-shm'));
+agentDb.i(agent);
+const reopened=agentDb.g({agentId:'main',env});
+assert.equal(JSON.parse(reopened.db.prepare('SELECT state_json FROM auth_profile_state WHERE state_key=?').get('fixture').state_json).token,'fixture-token');
+assert.equal(JSON.parse(reopened.db.prepare('SELECT event_json FROM transcript_events WHERE session_id=?').get('fixture-session').event_json).message.content,'fixture-message');
+agentDb.i(agent);
+assert.ok(!existsSync(path.join(path.dirname(agent),'openclaw-agent.sqlite')));
+const memoryFile=path.join(engine,'dist/extensions/memory-core/manager-runtime.js');
+if(!readFileSync(memoryFile,'utf8').includes('export {acquireCrossProcessLease as testGenerationLease}')) writeFileSync(memoryFile,readFileSync(memoryFile,'utf8')+'\\nexport {acquireCrossProcessLease as testGenerationLease};');
+const memory=await import(pathToFileURL(memoryFile));
+const generation=await memory.testGenerationLease(agent,'write');
+assert.ok(existsSync(agent+'.generation-writer.sqlite'));
+assert.ok(existsSync(agent+'.generation-lock.sqlite'));
+generation.release();
+const reindexFile=path.join(engine,'dist',readdirSync(path.join(engine,'dist')).find(n=>n.startsWith('manager-vector-warning-')));
+if(!readFileSync(reindexFile,'utf8').includes('export {resolveMemoryReindexLockPath as testReindexPath}')) writeFileSync(reindexFile,readFileSync(reindexFile,'utf8')+'\\nexport {resolveMemoryReindexLockPath as testReindexPath};');
+const reindex=await import(pathToFileURL(reindexFile).href+'?contract-test=1');
+const reindexPath=reindex.testReindexPath(agent);
+assert.equal(reindexPath,agent+'.reindex-lock.sqlite');
+const reindexLease=reindex.m(reindexPath,'exclusive');assert.ok(reindexLease);reindexLease.release();
+// The specialized config-doctor module also initializes excluded historical
+// migration resources. Exercise its complete coordinator region with its real
+// runtime dependencies, preserving its initializer and every coordinator byte.
+const roleFiles=['state-database-coordinator-Dscslso6.js','config-doctor/official-external-plugin-catalog-snapshot-store-DAJ2jZEn.js','worker/worker.mjs'];
+const roleSources=roleFiles.map(file=>readFileSync(path.join(engine,'dist',file),'utf8'));
+const digest=source=>createHash('sha256').update(source).digest('hex');
+const sqliteStart=roleSources[0].indexOf('//#region src/infra/sqlite-coordinator.ts');
+const sqliteEnd=roleSources[0].indexOf('//#endregion',sqliteStart);
+const sqliteRegion=roleSources[0].slice(sqliteStart,sqliteEnd);
+const stage=path.join(path.dirname(state),'coordinator-proof');mkdirSync(stage,{recursive:true});
+const base=pathToFileURL(engine).href;
+const {n:canonical}=await import(base+'/dist/root-path-existing-CLr-7fqF.js');
+const dependencies="import fs from 'node:fs';import os from 'node:os';import path from 'node:path';const fs$1=fs;\\n"+
+"import {n as resolvePathViaExistingAncestorSync} from '"+base+"/dist/root-path-existing-CLr-7fqF.js';\\nimport {o as tryAcquireExclusiveSqliteCoordinator} from '"+base+"/dist/node-sqlite-GN5_mcoB.js';\\nimport {t as applyPrivateModeSync} from '"+base+"/dist/private-mode-B6dWGRb2.js';\\nimport {o as sha256HexPrefixCore} from '"+base+"/dist/crypto-digest-IGAbV2KW.js';\\n";
+const extraction=[];
+for(let role=0;role<3;role++) {
+ const source=roleSources[role];let code,ranges;
+ if(role<2){const first=source.indexOf('//#region src/infra/sqlite-coordinator.ts'),firstEnd=source.indexOf('//#endregion',first),start=source.indexOf('//#region src/infra/state-database-coordinator.ts'),end=source.indexOf('//#endregion',start);ranges=[[first,firstEnd],[start,end]];code=ranges.map(([start,end])=>source.slice(start,end)).join('\\n');}
+ else{const start=source.indexOf('function resolveStateLifecycleRuntimeDirectory('),end=source.indexOf(',FAILOVER_REASONS$1',start);ranges=[[start,end]];code=sqliteRegion+'\\nconst __esmMin=fn=>fn;const init_boundary_path=()=>{},init_crypto_digest=()=>{},init_node_sqlite=()=>{},init_sqlite_coordinator=()=>{};\\n'+source.slice(start,end)+';init_state_database_coordinator();';}
+ assert.ok(ranges.every(([start,end])=>start>=0&&end>start));
+ extraction.push({file:roleFiles[role],sourceSha256:digest(source),ranges:ranges.map(([start,end])=>({startByte:Buffer.byteLength(source.slice(0,start)),endByte:Buffer.byteLength(source.slice(0,end)),sha256:digest(source.slice(start,end))}))});
+ writeFileSync(path.join(stage,'role'+role+'.mjs'),dependencies+code+'\\nexport {resolveLifecycleCoordinatorPath,acquireGatewayLifecycleCoordinator,acquireStateDatabaseCoordinator};');
+}
+const runner=path.join(stage,'runner.mjs');
+writeFileSync(runner,"const m=await import(process.argv[2]);let held=[];process.on('message',msg=>{try{if(msg.op==='acquire'){const p=msg.params;if(msg.explicit)p.coordinatorPath=m.resolveLifecycleCoordinatorPath(msg.family,p);const h=m[msg.family==='gateway-lifecycle'?'acquireGatewayLifecycleCoordinator':'acquireStateDatabaseCoordinator'](p);held.push(h);process.send({ok:true,path:h.path});}else{held.shift()?.release();process.send({ok:true})}}catch(e){process.send({ok:false,name:e.name,message:e.message})}});process.send({ready:true});");
+const children=[];
+async function child(role){const c=spawn(process.execPath,[runner,pathToFileURL(path.join(stage,'role'+role+'.mjs')).href],{stdio:['ignore','ignore','pipe','ipc'],env:process.env});children.push(c);await once(c,'message');return c;}
+async function command(child,message){const reply=once(child,'message');child.send(message);const result=(await reply)[0];if(!result.ok)assert.equal(result.name,'StateDatabaseCoordinatorContentionError',JSON.stringify(result));return result;}
+const runtimeDirectory=path.join(state,'locks'),uid=process.getuid?.();mkdirSync(runtimeDirectory,{recursive:true});
+try {
+ for(const databasePath of [agent,shared.J(env)]) for(const family of ['gateway-lifecycle','state-lifecycle']) for(const peer of [1,2]) for(const owner of [0,peer]) {
+  const other=owner===0?peer:0,a=await child(owner),b=await child(other),params={databasePath,runtimeDirectory,uid,busyTimeoutMs:0},request={op:'acquire',family,params};
+  const first=await command(a,request);assert.equal(first.ok,true);assert.match(first.path,/uniopc-state-locks/);
+  assert.equal((await command(a,request)).path,first.path);assert.equal((await command(b,request)).ok,false);
+  assert.equal((await command(b,{...request,params:{...params,databasePath:databasePath+'-different'}})).ok,true);await command(b,{op:'release'});
+  await command(a,{op:'release'});assert.equal((await command(b,request)).ok,false);await command(a,{op:'release'});assert.equal((await command(b,request)).path,first.path);await command(b,{op:'release'});
+  assert.equal((await command(a,{...request,explicit:true})).path,first.path);assert.equal((await command(b,request)).ok,false);await command(a,{op:'release'});
+  assert.equal((await command(a,request)).ok,true);a.kill('SIGKILL');await once(a,'exit');assert.equal((await command(b,request)).ok,true);await command(b,{op:'release'});b.kill();
+ }
+ const main=await import(pathToFileURL(path.join(stage,'role0.mjs')));
+ const params={databasePath:agent,runtimeDirectory,uid,busyTimeoutMs:0},customCoordinator=path.join(state,'custom-coordinator.sqlite');
+ const customLease=main.acquireStateDatabaseCoordinator({...params,coordinatorPath:customCoordinator});assert.equal(customLease.path,customCoordinator);customLease.release();customLease.release();
+ for(const uid of [undefined,501]) for(const databasePath of [agent,shared.J(env)]) for(const family of ['gateway-lifecycle','state-lifecycle']) {
+  const expected=path.join(canonical(runtimeDirectory),'uniopc-state-locks'+(uid===undefined?'':'-'+uid),family+'.'+digest(canonical(databasePath)).slice(0,8)+'.lock.sqlite');
+  for(let role=0;role<3;role++) assert.equal((await import(pathToFileURL(path.join(stage,'role'+role+'.mjs')))).resolveLifecycleCoordinatorPath(family,{databasePath,runtimeDirectory,uid}),expected);
+ }
+ console.log(JSON.stringify({coordinatorExtraction:extraction,agent,global:shared.J(env),threeRoleContention:true}));
+} finally {for(const child of children)child.kill();}
+const invocation=(await load('uniopc-cli-invocation')).n([], {argv1:path.join(engine,'unrecognized-launcher'),cwd:engine,moduleUrl:pathToFileURL(path.join(engine,'dist/entry.js')).href,execArgv:[]});
+assert.equal(invocation.args.at(-1),path.join(engine,'uniopc-engine.mjs'));
+const shim=await load('uniopc-cli-shim');
+await shim.r({stateDir:state,env,invocation});
+const cliEnv={...env,PATH:path.join(state,'tmp/agent-cli')+path.delimiter+process.env.PATH};
+const version=execFileSync('openclaw',['--version'],{env:cliEnv,encoding:'utf8',timeout:30000});
+assert.match(version,/2026\\.8\\.1/);
+const doctor=execFileSync('openclaw',['doctor','--non-interactive'],{env:{...cliEnv,CI:'1'},encoding:'utf8',timeout:60000});
+assert.ok(doctor.length>0);
+const policyFile=path.join(engine,'dist/backup-archive-path-policy-DKQb_csh.js');
+writeFileSync(policyFile,readFileSync(policyFile,'utf8')+'\\nexport {createBackupResourceInventory as testInventory, listDefaultAgentTemporaryRoots as testTemporaryRoots, MANAGED_STATE_ROOTS as testManagedRoots, isPathWithin as testIsPathWithin, formatBackupArchiveTimestamp as testTimestamp};');
+const policy=await import(pathToFileURL(policyFile).href+'?inventory-contract=1');
+const inventoryStart=roleSources[2].indexOf('async function createBackupResourceInventory('),inventoryEnd=roleSources[2].indexOf('var ',inventoryStart),inventoryBody=roleSources[2].slice(inventoryStart,inventoryEnd);
+assert.ok(inventoryStart>=0&&inventoryEnd>inventoryStart);
+const workerInventory=new Function('path','resolveOpenClawStateSqlitePath','MANAGED_STATE_ROOTS','listDefaultAgentTemporaryRoots','isPathWithin$1',inventoryBody+';return createBackupResourceInventory;')(path,shared.J,policy.testManagedRoots,policy.testTemporaryRoots,policy.testIsPathWithin);
+const inventoryParams={stateDir:state,configPath:path.join(state,'config.json'),oauthDir:path.join(state,'credentials'),agentRoots:[],workspaceDirs:[],pluginResources:[],pluginRoots:[],onlyConfig:false};
+const inventoryTests=[];
+for(const create of [policy.testInventory,workerInventory]) {
+ const inventory=await create(inventoryParams),base=path.join(state,'agents/node_modules/agent');
+ for(const suffix of ['','-wal','-shm','-journal']) {const file=path.join(base,'uniopc-agent.sqlite'+suffix);assert.equal(inventory.isPackageContent(file),false);inventoryTests.push(file);}
+ for(const name of ['openclaw-agent.sqlite','uniopc-agentXsqlite','prefix-uniopc-agent.sqlite','uniopc-agent.sqlite-extra']) assert.equal(inventory.isPackageContent(path.join(base,name)),true);
+ const custom=path.join(base,'custom.sqlite');
+ const registered=await create({...inventoryParams,agentRoots:[{agentId:'node_modules',sourcePath:path.join(state,'registered-root'),databasePath:custom}]});
+ assert.equal(registered.isPackageContent(custom),false);
+}
+const nowMs=Date.UTC(2026,2,9,0,0,0);
+assert.equal(policy.c(nowMs),policy.testTimestamp(nowMs)+'-uniopc-backup');
+assert.equal(policy.o(nowMs),policy.c(nowMs)+'.tar.gz');
+assert.ok(readFileSync(path.join(engine,'dist/register.backup-BFONF7_5.js'),'utf8').includes('const BACKUP_CRON_JOB_NAME = "openclaw-backup-scheduled";'));
+console.log(JSON.stringify({inventorySourceSha256:digest(roleSources[2]),inventoryRange:{startByte:Buffer.byteLength(roleSources[2].slice(0,inventoryStart)),endByte:Buffer.byteLength(roleSources[2].slice(0,inventoryEnd)),sha256:digest(inventoryBody)},inventoryTests,regexProtection:true}));
+const archive=path.join(path.dirname(state),'custom.tar.gz');
+const backup=execFileSync('openclaw',['backup','create','--output',archive,'--verify','--no-include-workspace','--json'],{env:cliEnv,encoding:'utf8',timeout:60000});
+assert.ok(existsSync(archive));
+const backupResult=JSON.parse(backup);
+assert.equal(backupResult.archivePath,archive);
+assert.ok(backupResult.archiveRoot.endsWith('-uniopc-backup'));
+const listed=execFileSync('tar',['-tzf',archive],{encoding:'utf8'}).trim().split(/\\r?\\n/).filter(Boolean).map(name=>name.replace(/^\\.\\//,''));
+assert.deepEqual([...new Set(listed.map(name=>name.split('/')[0]))],[backupResult.archiveRoot]);
+execFileSync('openclaw',['backup','verify',archive,'--json'],{env:cliEnv,encoding:'utf8',timeout:60000});
+const restored=path.join(path.dirname(state),'restored');
+execFileSync('openclaw',['backup','restore',archive,'--target',restored,'--json'],{env:cliEnv,encoding:'utf8',timeout:60000});
+const restoredFiles=[];
+function scan(dir){for(const e of readdirSync(dir,{withFileTypes:true})){const p=path.join(dir,e.name);if(e.isDirectory())scan(p);else restoredFiles.push(p)}}scan(restored);
+const restoredAgent=restoredFiles.find(p=>p.endsWith('/agents/main/agent/uniopc-agent.sqlite'));
+assert.ok(restoredAgent,JSON.stringify(restoredFiles));
+assert.ok(restoredFiles.some(p=>p.endsWith('/state/uniopc.sqlite')));
+assert.ok(!restoredFiles.some(p=>/openclaw(?:-agent)?\.sqlite/.test(p)));
+const {DatabaseSync}=await import('node:sqlite');const restoredDb=new DatabaseSync(restoredAgent,{readOnly:true});
+assert.equal(JSON.parse(restoredDb.prepare('SELECT event_json FROM transcript_events WHERE session_id=?').get('fixture-session').event_json).message.content,'fixture-message');restoredDb.close();
+const manifestFile=path.join(restored,backupResult.archiveRoot,'manifest.json'),manifestText=readFileSync(manifestFile,'utf8');
+for(const badRoot of ['mismatched-uniopc-backup','../escape']) {
+ writeFileSync(manifestFile,JSON.stringify({...JSON.parse(manifestText),archiveRoot:badRoot}));
+ const badArchive=path.join(path.dirname(state),badRoot.startsWith('.')?'unsafe.tar.gz':'mismatch.tar.gz');
+ execFileSync('tar',['-czf',badArchive,'-C',restored,backupResult.archiveRoot]);
+ const verify=spawnSync('openclaw',['backup','verify',badArchive,'--json'],{env:cliEnv,encoding:'utf8',timeout:60000});assert.notEqual(verify.status,0);
+ const badTarget=badArchive+'.restored';
+ const restore=spawnSync('openclaw',['backup','restore',badArchive,'--target',badTarget,'--json'],{env:cliEnv,encoding:'utf8',timeout:60000});assert.notEqual(restore.status,0);assert.ok(!existsSync(badTarget));
+}
+writeFileSync(manifestFile,manifestText);
+console.log(JSON.stringify({agent,global:shared.J(env),version:version.trim(),doctor:true,custom:true,reopened:true,backupRestore:true,sidecars:true,threeRoleContention:true,backupNameSafety:true,regexProtection:true}));
+`
+  const result=spawnSync(process.execPath,['--input-type=module','-e',program,engine,join(root,'state')],{encoding:'utf8',timeout:300000,env:{PATH:process.env.PATH,HOME:root,TMPDIR:root,CI:'1',NODE_OPTIONS:'',NODE_PATH:''}})
+  assert.equal(result.status,0,result.stderr+'\n'+result.stdout)
+  t.diagnostic(result.stdout.trim())
+})
+
+test('generated state rejects CLI/session declaration and anchor drift with zero writes', async t => {
+  const {GENERATED_STATE_FUNCTIONS}=await import('./verify-uniopc-whitelabel-runtime.mjs')
+  for(const variant of ['comment','string','nested','duplicate','extra-file','entry-set','extra-prefix','partial-role']) {
+    const root=await mkdtemp(join(tmpdir(),'uniopc-generated-preflight-'))
+    t.after(()=>rm(root,{recursive:true,force:true}))
+    await addLifecycleFixtures(root)
+    await writeFile(join(root,'dist/paths-lock.js'),'const suffix = uid != null ? `openclaw-${uid}` : "openclaw";')
+    const contract=GENERATED_STATE_FUNCTIONS.find(item=>item.name==='buildPackageRootCliArgs' && item.role!=='worker/worker.mjs')
+    const file=join(root,'dist',contract.role)
+    const source=await readFile(file,'utf8')
+    if(variant==='comment') await writeFile(file,source.replace(contract.body,'/*'+contract.body+'*/'))
+    if(variant==='string') await writeFile(file,source.replace(contract.body,'const fake='+JSON.stringify(contract.body)+';'))
+    if(variant==='nested') await writeFile(file,source.replace(contract.body,'function wrapper(){'+contract.body+'}'))
+    if(variant==='duplicate') await writeFile(file,source+'\n'+contract.body)
+    if(variant==='extra-file') await writeFile(join(root,'dist','extra-cli.js'),contract.body)
+    if(variant==='entry-set') await writeFile(file,source.replace('"openclaw.mjs"]','"openclaw.mjs", "drift"]'))
+    if(variant==='extra-prefix') await writeFile(join(root,'dist','extra-temp.js'),'const prefix="openclaw-agent-cli";')
+    if(variant==='partial-role') await writeFile(file,source.replace('return [path.join(packageRoot, "openclaw.mjs")];','return [path.join(packageRoot, "uniopc-engine.mjs")];'))
+    const before=await distSnapshot(root)
+    await assert.rejects(rebrandCompiledRuntimePaths(root),/Generated state/)
+    assert.deepEqual(await distSnapshot(root),before,variant)
+  }
+})
+
+test('backup output contracts reject missing, duplicate, partial, drifted and unknown names before writes', async t => {
+  const {BACKUP_OUTPUT_ANCHORS}=await import('./verify-uniopc-whitelabel-runtime.mjs')
+  for(const variant of ['missing','duplicate','partial','drift','unknown-old','unknown-new','cron']) {
+    const root=await mkdtemp(join(tmpdir(),'uniopc-backup-preflight-'));t.after(()=>rm(root,{recursive:true,force:true}))
+    await addLifecycleFixtures(root)
+    await writeFile(join(root,'dist/paths-lock.js'),'const suffix = uid != null ? `openclaw-${uid}` : "openclaw";')
+    const {role,anchor}=BACKUP_OUTPUT_ANCHORS[0],file=join(root,'dist',role),source=await readFile(file,'utf8')
+    if(variant==='missing') await rm(file)
+    if(variant==='duplicate') await writeFile(join(root,'dist','duplicate-backup.js'),source)
+    if(variant==='partial') {const worker=join(root,'dist/worker/worker.mjs'),body=await readFile(worker,'utf8'),target=BACKUP_OUTPUT_ANCHORS.find(item=>item.role==='worker/worker.mjs');await writeFile(worker,body.replace(target.anchor,target.anchor.replaceAll('openclaw-backup','uniopc-backup')))}
+    if(variant==='drift') await writeFile(file,source.replace(anchor,anchor.replace('formatBackupArchiveTimestamp(nowMs)','formatBackupArchiveTimestamp(nowMs + 1)')))
+    if(variant.startsWith('unknown-')) await writeFile(join(root,'dist','unknown-output.txt'),variant==='unknown-old'?'test-openclaw-backup':'test-uniopc-backup')
+    if(variant==='cron'){const cron=join(root,'dist/register.backup-BFONF7_5.js');await writeFile(cron,(await readFile(cron,'utf8')).replace('openclaw-backup-scheduled','uniopc-backup-scheduled'))}
+    const before=await distSnapshot(root)
+    await assert.rejects(rebrandCompiledRuntimePaths(root),/Generated state|Backup output|Backup scheduled/)
+    assert.deepEqual(await distSnapshot(root),before,variant)
+  }
+})
+
+test('escaped agent database contracts reject partial, duplicate, drift and unknown escaped forms atomically', async t => {
+  const {ESCAPED_DATABASE_ANCHORS}=await import('./verify-uniopc-whitelabel-runtime.mjs')
+  for(const variant of ['partial-main','partial-worker','missing','duplicate','drift','unknown-old','unknown-new']) {
+    const root=await mkdtemp(join(tmpdir(),'uniopc-escaped-db-'));t.after(()=>rm(root,{recursive:true,force:true}))
+    await addLifecycleFixtures(root)
+    await writeFile(join(root,'dist/paths-lock.js'),'const suffix = uid != null ? `openclaw-${uid}` : "openclaw";')
+    const contract=ESCAPED_DATABASE_ANCHORS[variant==='partial-worker'?1:0],file=join(root,'dist',contract.role),source=await readFile(file,'utf8')
+    if(variant.startsWith('partial')) await writeFile(file,source.replace(contract.anchor,contract.anchor.replace('openclaw-agent','uniopc-agent')))
+    if(variant==='missing') await rm(file)
+    if(variant==='duplicate') await writeFile(join(root,'dist','extra-inventory.js'),source)
+    if(variant==='drift') await writeFile(file,source.replace(contract.anchor,contract.anchor.replace('(?:-wal|-shm|-journal)?','(?:-wal|-shm)?')))
+    if(variant.startsWith('unknown')) await writeFile(join(root,'dist','escaped-extra.txt'),variant==='unknown-old'?'openclaw-agent\\.sqlite':'uniopc-agent\\.sqlite')
+    const before=await distSnapshot(root)
+    await assert.rejects(rebrandCompiledRuntimePaths(root),/Generated state|Lifecycle coordinator/)
+    assert.deepEqual(await distSnapshot(root),before,variant)
+  }
 })
