@@ -606,20 +606,43 @@ function patchGeneratedState(source) {
 function verifyGeneratedTopLevelRanges(source, ranges, label) {
   const parser = `import {SourceTextModule} from 'node:vm';
 import {readFileSync} from 'node:fs';
+let phase='base-module-parse';
 try {
   const {source,ranges}=JSON.parse(readFileSync(0,'utf8'));
   new SourceTextModule(source);
+  phase='export-binding-proof';
   new SourceTextModule(source+'\\nexport {'+ranges.map((r,i)=>r.name+' as __uniopc_contract_'+i).join(',')+'};');
+  phase='remove-declaration-and-redeclare-proof';
   let removed=source;
   for(const range of [...ranges].sort((a,b)=>b.start-a.start)) removed=removed.slice(0,range.start)+removed.slice(range.end);
   new SourceTextModule(removed+'\\n'+ranges.map(r=>'const '+r.name+'=0;').join('\\n'));
-} catch {process.stderr.write('Generated state top-level contract failed\\n');process.exitCode=1;}`
+} catch(error) {
+  // Only the error summary crosses the pipe; never source, stack, or input JSON.
+  const bounded=value=>String(value).replace(/[\\x00-\\x1f\\x7f]/g,' ').slice(0,160);
+  process.stderr.write(JSON.stringify({phase,name:bounded(error.name),message:bounded(error.message)}));
+  process.exitCode=1;
+}`
   const env={...process.env}
   for(const key of Object.keys(env)) if(['NODE_OPTIONS','NODE_PATH'].includes(key.toUpperCase())) delete env[key]
   try {
     execFileSync(process.execPath,['--experimental-vm-modules','--no-warnings','--input-type=module','-e',parser],
       {input:JSON.stringify({source,ranges}),encoding:'utf8',env,stdio:['pipe','pipe','pipe'],timeout:60000,maxBuffer:65536})
-  } catch {assert.fail(`Generated state ${label} top-level uniqueness structure drift`)}
+  } catch(error) {
+    const token=value=>typeof value==='string' && /^[A-Za-z0-9_-]{1,40}$/.test(value) ? value : null
+    const stderr=Buffer.from(error.stderr ?? '')
+    const details={code:token(error.code),status:Number.isInteger(error.status)?error.status:null,
+      signal:token(error.signal),timeout:error.code==='ETIMEDOUT'}
+    try {
+      const child=JSON.parse(stderr.toString('utf8'))
+      assert.deepEqual(Object.keys(child).sort(),['message','name','phase'])
+      assert.ok(['base-module-parse','export-binding-proof','remove-declaration-and-redeclare-proof'].includes(child.phase))
+      for(const key of ['name','message']) assert.ok(typeof child[key]==='string' && child[key].length<=160 && !/[\x00-\x1f\x7f]/.test(child[key]))
+      details.child=child
+    } catch {
+      details.stderr={bytes:stderr.length,sha256:createHash('sha256').update(stderr).digest('hex')}
+    }
+    assert.fail(`Generated state ${label} top-level uniqueness structure drift: ${JSON.stringify(details)}`)
+  }
 }
 
 export function inspectGeneratedStateSources(sources, {allowUnpatched = false} = {}) {

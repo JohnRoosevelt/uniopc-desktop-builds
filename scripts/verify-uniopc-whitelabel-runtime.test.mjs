@@ -473,3 +473,64 @@ test('archive gate audits plugin root display names and all generated state text
     await assert.rejects(verifyRuntimeDirectory(fixture.output),/Generated state unknown basename role/)
   }
 })
+
+// Exercise the private proof with real parser children and synthetic process
+// failures, without adding a production injection or exporting an internal API.
+async function generatedProof(exec = execFileSync) {
+  const {runInNewContext} = await import('node:vm')
+  const {createHash} = await import('node:crypto')
+  const text = await readFile(new URL('./verify-uniopc-whitelabel-runtime.mjs',import.meta.url),'utf8')
+  const start = text.indexOf('function verifyGeneratedTopLevelRanges(')
+  const end = text.indexOf('\nexport function inspectGeneratedStateSources',start)
+  return runInNewContext(`(${text.slice(start,end)})`,{assert,execFileSync:exec,process,Buffer,createHash})
+}
+
+test('generated proof retains each failed parse phase without evaluating source', async () => {
+  const proof = await generatedProof()
+  const cases = [
+    ['const = secretSource;',[], 'base-module-parse'],
+    ['function outer(){const target=1;}',[{name:'target',start:0,end:0}], 'export-binding-proof'],
+    ['const target=1;',[{name:'target',start:0,end:0}], 'remove-declaration-and-redeclare-proof'],
+  ]
+  for(const [source,ranges,phase] of cases) {
+    assert.throws(()=>proof(source,ranges,'fixture'), error=>{
+      assert.match(error.message,/top-level uniqueness structure drift/)
+      const details=JSON.parse(error.message.slice(error.message.indexOf(': ')+2))
+      assert.equal(details.child.phase,phase)
+      assert.equal(details.child.name,'SyntaxError')
+      assert.equal(details.status,1)
+      assert.ok(details.child.message.length<=160)
+      assert.ok(!error.message.includes(source))
+      return true
+    })
+  }
+  proof('throw new Error("must never execute"); const target=1;',[{name:'target',start:39,end:54}],'parse-only')
+})
+
+test('generated proof bounds process failure diagnostics and rejects untrusted stderr', async () => {
+  for(const failure of [
+    {code:'ETIMEDOUT',status:null,signal:'SIGTERM'},
+    {code:'EPIPE',status:null,signal:null},
+    {status:null,signal:'SIGKILL'},
+    {status:1,stderr:'secretSource'.repeat(10000)},
+    {status:1,stderr:JSON.stringify({phase:'base-module-parse',name:'SyntaxError',message:'x'.repeat(161)})},
+  ]) {
+    const proof=await generatedProof((_command,_args,options)=>{
+      assert.equal(options.timeout,60000)
+      assert.equal(options.maxBuffer,65536)
+      throw Object.assign(new Error('secretSource command input'),failure)
+    })
+    assert.throws(()=>proof('secretSource',[],'fixture'),error=>{
+      const details=JSON.parse(error.message.slice(error.message.indexOf(': ')+2))
+      assert.equal(details.code,failure.code??null)
+      assert.equal(details.signal,failure.signal??null)
+      assert.equal(details.status,failure.status)
+      assert.equal(details.timeout,failure.code==='ETIMEDOUT')
+      assert.equal(details.stderr.bytes,Buffer.byteLength(failure.stderr??''))
+      assert.match(details.stderr.sha256,/^[a-f0-9]{64}$/)
+      assert.ok(error.message.length<450)
+      assert.ok(!error.message.includes('secretSource'))
+      return true
+    })
+  }
+})
