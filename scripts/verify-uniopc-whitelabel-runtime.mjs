@@ -68,17 +68,18 @@ const nativeDeclaration = String.raw`\bfunction${nativeTrivia}\*?${nativeTrivia}
 
 // Only this flagged, isolated subprocess imports SourceTextModule. It parses
 // three variants, never links/evaluates, and never prints the engine source.
-function verifyWorkerTopLevel(source, start, end) {
+function verifyWorkerTopLevel(source, start, end, name = 'tryNativeRequireJavaScriptModule', label = 'Windows worker') {
   const parser = `import { SourceTextModule } from 'node:vm';
 import { readFileSync } from 'node:fs';
 try {
   const source=readFileSync(0,'utf8');
   const [start,end]=process.argv.slice(1).map(Number);
-  const sentinel='\\nconst tryNativeRequireJavaScriptModule=0;';
+  const name=process.argv[3];
+  const sentinel='\\nconst '+name+'=0;';
   new SourceTextModule(source);
   let duplicate=false;
   try { new SourceTextModule(source+sentinel); }
-  catch(error) { duplicate=error instanceof SyntaxError && error.message.includes("Identifier 'tryNativeRequireJavaScriptModule' has already been declared"); }
+  catch(error) { duplicate=error instanceof SyntaxError && error.message.includes("Identifier '"+name+"' has already been declared"); }
   if(!duplicate) throw new Error();
   new SourceTextModule(source.slice(0,start)+source.slice(end)+sentinel);
 } catch { process.stderr.write('Worker top-level contract failed\\n');process.exitCode=1; }
@@ -86,9 +87,9 @@ try {
   const env={...process.env}
   for(const key of Object.keys(env)) if(['NODE_OPTIONS','NODE_PATH'].includes(key.toUpperCase())) delete env[key]
   try {
-    execFileSync(process.execPath,['--experimental-vm-modules','--no-warnings','--input-type=module','-e',parser,String(start),String(end)],
+    execFileSync(process.execPath,['--experimental-vm-modules','--no-warnings','--input-type=module','-e',parser,String(start),String(end),name],
       {input:source,encoding:'utf8',env,stdio:['pipe','pipe','pipe'],timeout:60000,maxBuffer:65536})
-  } catch { assert.fail('Windows worker top-level uniqueness structure drift') }
+  } catch { assert.fail(`${label} top-level uniqueness structure drift`) }
 }
 
 export function inspectWindowsNativeRequireSources(sources, { allowUnpatched = false } = {}) {
@@ -143,6 +144,45 @@ export function inspectWindowsNativeRequireSources(sources, { allowUnpatched = f
   assert.equal(worker.source.slice(worker.start,worker.start+workerBody.length),workerBody,'Windows worker helper structure drift')
   verifyWorkerTopLevel(worker.source,worker.start,worker.start+workerBody.length)
   return [main,{...worker,end:worker.start+workerBody.length,body:workerBody,patchedBody:WINDOWS_WORKER_NATIVE_REQUIRE_PATCHED,role:'worker'}]
+}
+
+// User-approved fresh-state namespace switch: old CLIs are unsupported for new
+// state. No old locks are migrated/deleted; SQLite coordination stays upstream.
+// Exact pinned 2026.8.1 functions change only their two suffix literals.
+export const LIFECYCLE_PATH_READABLE_ORIGINAL = "function resolveLifecycleCoordinatorPath(family, params) {\n\tconst canonicalDatabasePath = resolvePathViaExistingAncestorSync(params.databasePath);\n\tconst canonicalRuntimeDirectory = resolvePathViaExistingAncestorSync(params.runtimeDirectory);\n\tconst suffix = params.uid === void 0 ? \"openclaw-state-locks\" : `openclaw-state-locks-${params.uid}`;\n\treturn path.join(canonicalRuntimeDirectory, suffix, `${family}.${sha256HexPrefixCore(canonicalDatabasePath, 8)}.lock.sqlite`);\n}"
+export const LIFECYCLE_PATH_WORKER_ORIGINAL = "function resolveLifecycleCoordinatorPath(Ot,Zt){let _n=resolvePathViaExistingAncestorSync(Zt.databasePath),Dn=resolvePathViaExistingAncestorSync(Zt.runtimeDirectory),kn=Zt.uid===void 0?`openclaw-state-locks`:`openclaw-state-locks-${Zt.uid}`;return path.join(Dn,kn,`${Ot}.${sha256HexPrefixCore(_n,8)}.lock.sqlite`)}"
+export const LIFECYCLE_PATH_ROLES = [
+  { role: 'main', path: /(?:^|\/)dist\/state-database-coordinator-[^/]+\.js$/, body: LIFECYCLE_PATH_READABLE_ORIGINAL },
+  { role: 'config-doctor', path: /(?:^|\/)dist\/config-doctor\/official-external-plugin-catalog-snapshot-store-[^/]+\.js$/, body: LIFECYCLE_PATH_READABLE_ORIGINAL },
+  { role: 'worker', path: /(?:^|\/)dist\/worker\/worker\.mjs$/, body: LIFECYCLE_PATH_WORKER_ORIGINAL },
+]
+export function inspectLifecycleCoordinatorSources(sources, { allowUnpatched = false } = {}) {
+  const declarations = sources.flatMap(entry => [...entry.source.matchAll(
+    new RegExp(String.raw`\bfunction${nativeTrivia}\*?${nativeTrivia}resolveLifecycleCoordinatorPath${nativeTrivia}\(`, 'g'),
+  )].map(match => ({ ...entry, start: match.index })))
+  assert.equal(declarations.length, 3, 'Lifecycle coordinator requires exactly three role helpers')
+  const inspected = LIFECYCLE_PATH_ROLES.map(({role, path, body}) => {
+    assert.equal(sources.filter(entry => path.test(entry.path.replaceAll('\\', '/'))).length, 1,
+      `Lifecycle coordinator requires exactly one ${role} role file`)
+    const entries = declarations.filter(entry => path.test(entry.path.replaceAll('\\', '/')))
+    assert.equal(entries.length, 1, `Lifecycle coordinator requires exactly one ${role} helper`)
+    const entry = entries[0]
+    const patchedBody = body.replaceAll('openclaw-state-locks', 'uniopc-state-locks')
+    const patched = entry.source.slice(entry.start, entry.start + patchedBody.length) === patchedBody
+    assert.ok(patched || (allowUnpatched && entry.source.slice(entry.start, entry.start + body.length) === body),
+      `Lifecycle coordinator ${role} suffix patch missing or function structure drift`)
+    const matchedBody = patched ? patchedBody : body
+    // Parse only: prove this exact range is the unique top-level executable
+    // declaration, rather than matching bytes inside comments, strings or scopes.
+    verifyWorkerTopLevel(entry.source, entry.start, entry.start + matchedBody.length,
+      'resolveLifecycleCoordinatorPath', `Lifecycle coordinator ${role}`)
+    return {...entry, role, body: matchedBody, patchedBody}
+  })
+  // No extra legacy suffix may hide in another chunk or outside the helper.
+  const legacyCount = sources.reduce((count, entry) => count + entry.source.split('openclaw-state-locks').length - 1, 0)
+  const expectedLegacyCount = inspected.filter(entry => entry.body !== entry.patchedBody).length * 2
+  assert.equal(legacyCount, expectedLegacyCount, 'Lifecycle coordinator residual legacy suffix outside pinned helpers')
+  return inspected
 }
 
 export function assertRuntimeEntryNamesBranded(names) {
@@ -272,9 +312,12 @@ export async function verifyRuntimeDirectory(runtimeDirectory = RUNTIME_DIR) {
     try {
       execFileSync(tarBin(), ['-xzf', archive, '-C', stage], { stdio: 'ignore' })
       const nativeLoaderSources = []
+      const lifecycleSources = []
       await walk(stage, async path => {
         const rel = path.slice(stage.length + 1).replaceAll('\\', '/')
         const normalized = rel.replace(/^\.\//, '')
+        const lifecycleCandidate = BRANDED_ENGINE_ROOT.test(normalized)
+          && /^dist\/.*\.[cm]?js$/i.test(normalized.replace(BRANDED_ENGINE_ROOT, ''))
         const nativeCandidate = artifact.platform === 'win32' && BRANDED_ENGINE_ROOT.test(normalized)
           && /\/uniopc-engine\/dist\/.*\.[cm]?js$/i.test(normalized) && !/\/node_modules\//.test(normalized.split('/uniopc-engine/')[1])
         // Native contracts inspect bytes independently of branding's readability
@@ -284,6 +327,11 @@ export async function verifyRuntimeDirectory(runtimeDirectory = RUNTIME_DIR) {
           assert.ok(!nativeBytes.includes(0), `NUL in Windows native loader candidate: ${normalized}`)
           const source = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(nativeBytes)
           nativeLoaderSources.push({ path: normalized, source })
+        }
+        if (lifecycleCandidate) {
+          const bytes = await readFile(path)
+          assert.ok(!bytes.includes(0), `NUL in lifecycle coordinator source: ${normalized}`)
+          lifecycleSources.push({path: normalized, source: new TextDecoder('utf-8', {fatal: true, ignoreBOM: true}).decode(bytes)})
         }
         const bytes = await readFile(path).catch(() => null)
         if (bytes === null || !isReadableText(bytes)) return
@@ -340,6 +388,7 @@ export async function verifyRuntimeDirectory(runtimeDirectory = RUNTIME_DIR) {
         }
       })
       if (artifact.platform === 'win32') inspectWindowsNativeRequireSources(nativeLoaderSources)
+      inspectLifecycleCoordinatorSources(lifecycleSources)
     } finally {
       await rm(stage, { recursive: true, force: true })
     }

@@ -1,3 +1,4 @@
+import { inspectLifecycleCoordinatorSources } from './verify-uniopc-whitelabel-runtime.mjs'
 import { isManagedSkillMarkdown, rebrandSkillMarkdown } from './uniopc-skill-branding.mjs'
 import { readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
 import { basename, join, relative } from 'node:path'
@@ -121,10 +122,15 @@ export async function rebrandCompiledRuntimePaths(packageRoot) {
     changes.set(path, { rel, basename, branded })
   }
   const textFiles = files.filter(path => /\.(?:js|mjs|cjs|ts|mts|json|html|css|map)$/i.test(path))
+  // Preflight every role before writing or renaming any staged file.
+  const sources = await Promise.all(textFiles.map(async path => ({path, source: await readFile(path, 'utf8')})))
+  const lifecycle = inspectLifecycleCoordinatorSources(sources.filter(entry => /\.[cm]?js$/i.test(entry.path)), {allowUnpatched: true})
+  const lifecycleByPath = new Map(lifecycle.map(entry => [entry.path, entry]))
+  const patches = []
   let lockPathMatches = 0
-  for (const path of textFiles) {
-    const before = await readFile(path, 'utf8')
-    let after = before
+  for (const {path, source: before} of sources) {
+    const coordinator = lifecycleByPath.get(path)
+    let after = coordinator ? before.slice(0, coordinator.start) + coordinator.patchedBody + before.slice(coordinator.start + coordinator.body.length) : before
     for (const { basename, branded } of changes.values()) after = after.replaceAll(basename, branded)
     if (/\/paths-[^/]+\.js$/i.test(path.replaceAll('\\', '/'))) {
       const legacy = '`openclaw-${uid}` : "openclaw"'
@@ -136,9 +142,10 @@ export async function rebrandCompiledRuntimePaths(packageRoot) {
         lockPathMatches++
       }
     }
-    if (after !== before) await writeFile(path, after)
+    if (after !== before) patches.push([path, after])
   }
   if (lockPathMatches !== 1) throw new Error(`Expected one gateway lock directory definition, found ${lockPathMatches}`)
+  for (const [path, after] of patches) await writeFile(path, after)
   for (const [path, { branded }] of changes) await rename(path, join(path, '..', branded))
   return [...changes.values()].map(({ rel }) => rel)
 }

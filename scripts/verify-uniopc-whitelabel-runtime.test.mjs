@@ -247,6 +247,7 @@ async function nativeArchive(t, {platform='win32', source=nativeSource(WINDOWS_N
   await writeFile(join(engine,'dist/loader-hash.js'),source)
   await mkdir(join(engine,'dist/worker'),{recursive:true})
   await writeFile(join(engine,'dist/worker/worker.mjs'),workerSource())
+  await addLifecycleFixtures(engine, true)
   const output=join(root,'output');await mkdir(output)
   const archive=`uniopc-engine-runtime-${platform}-x64.tar.gz`
   execFileSync('tar',['-czf',join(output,archive),'-C',join(root,'stage'),'tools'])
@@ -265,10 +266,10 @@ test('Windows cached archive verifier rejects missing/unpatched/duplicate/drifte
     const fixture=await nativeArchive(t,{source})
     await assert.rejects(verifyRuntimeDirectory(fixture.output),/exactly one|patch missing/)
   }
-  await writeFile(join(valid.engine,'dist/worker/worker.mjs'),workerSource(false))
+  await writeFile(join(valid.engine,'dist/worker/worker.mjs'),workerSource(false)+'\n'+lifecycleWorkerFixture.replaceAll('openclaw-state-locks','uniopc-state-locks'))
   execFileSync('tar',['-czf',join(valid.output,'uniopc-engine-runtime-win32-x64.tar.gz'),'-C',join(valid.root,'stage'),'tools'])
   await assert.rejects(verifyRuntimeDirectory(valid.output),/worker compatibility patch missing/)
-  await writeFile(join(valid.engine,'dist/worker/worker.mjs'),workerSource())
+  await writeFile(join(valid.engine,'dist/worker/worker.mjs'),workerSource()+'\n'+lifecycleWorkerFixture.replaceAll('openclaw-state-locks','uniopc-state-locks'))
   await writeFile(join(valid.engine,'dist/duplicate.js'),nativeSource(WINDOWS_NATIVE_REQUIRE_PATCHED))
   execFileSync('tar',['-czf',join(valid.output,'uniopc-engine-runtime-win32-x64.tar.gz'),'-C',join(valid.root,'stage'),'tools'])
   await assert.rejects(verifyRuntimeDirectory(valid.output),/exactly one/)
@@ -306,7 +307,7 @@ test('dual loader roles reject missing, duplicate, nested, string/comment worker
 test('standalone Windows archive verifier and VM uniqueness checks work without node_modules and never evaluate worker code', async t => {
   const fixture=await nativeArchive(t)
   const marker=join(fixture.root,'must-not-evaluate')
-  await writeFile(join(fixture.engine,'dist/worker/worker.mjs'),workerSource()
+  await writeFile(join(fixture.engine,'dist/worker/worker.mjs'),workerSource()+'\n'+lifecycleWorkerFixture.replaceAll('openclaw-state-locks','uniopc-state-locks')
     +';fs.writeFileSync('+JSON.stringify(marker)+',"bad");throw new Error("must not evaluate");')
   execFileSync('tar',['-czf',join(fixture.output,'uniopc-engine-runtime-win32-x64.tar.gz'),'-C',join(fixture.root,'stage'),'tools'])
   const script=join(fixture.root,'verify.mjs')
@@ -323,7 +324,7 @@ test('standalone Windows archive verifier and VM uniqueness checks work without 
 
 test('Windows native archive collection accepts literal U+FFFD independently of branding readability', async t => {
   const fixture=await nativeArchive(t,{source:nativeSource(WINDOWS_NATIVE_REQUIRE_PATCHED)+'\nconst replacement="�";'})
-  await writeFile(join(fixture.engine,'dist/worker/worker.mjs'),workerSource()+'\nconst replacement="�";')
+  await writeFile(join(fixture.engine,'dist/worker/worker.mjs'),workerSource()+'\n'+lifecycleWorkerFixture.replaceAll('openclaw-state-locks','uniopc-state-locks')+'\nconst replacement="�";')
   const repack=()=>execFileSync('tar',['-czf',join(fixture.output,'uniopc-engine-runtime-win32-x64.tar.gz'),'-C',join(fixture.root,'stage'),'tools'])
   repack()
   assert.equal((await verifyRuntimeDirectory(fixture.output)).artifactCount,1)
@@ -358,6 +359,7 @@ test('archive gate audits only managed Skill prose and rejects unconverted descr
   const templates = join(engine, 'docs/reference/templates')
   await mkdir(templates, { recursive: true })
   for (const name of ['AGENTS', 'SOUL', 'TOOLS', 'IDENTITY', 'USER', 'BOOTSTRAP']) await writeFile(join(templates, `${name}.md`), 'Uniopc')
+  await addLifecycleFixtures(engine, true)
   const skill = join(engine, 'skills/healthcheck/SKILL.md')
   await mkdir(join(skill, '..'), { recursive: true })
   const archive = 'uniopc-engine-runtime-linux-x64.tar.gz'
@@ -371,4 +373,50 @@ test('archive gate audits only managed Skill prose and rejects unconverted descr
   await writeFile(skill, '---\nname: OpenClaw\ndescription: Uniopc hosts\nmetadata: { brand: OpenClaw }\n---\n`OpenClaw` https://github.com/OpenClaw/example\nCopyright (c) 2026 OpenClaw Foundation\nopenclaw security audit --deep\nOPENCLAW_STATE_DIR OpenClawConfig\n')
   repack()
   assert.equal((await verifyRuntimeDirectory(root)).artifactCount, 1)
+})
+
+// Verbatim path functions from the installed pinned engine, independent of production constants.
+const lifecycleReadableFixture = "function resolveLifecycleCoordinatorPath(family, params) {\n\tconst canonicalDatabasePath = resolvePathViaExistingAncestorSync(params.databasePath);\n\tconst canonicalRuntimeDirectory = resolvePathViaExistingAncestorSync(params.runtimeDirectory);\n\tconst suffix = params.uid === void 0 ? \"openclaw-state-locks\" : `openclaw-state-locks-${params.uid}`;\n\treturn path.join(canonicalRuntimeDirectory, suffix, `${family}.${sha256HexPrefixCore(canonicalDatabasePath, 8)}.lock.sqlite`);\n}"
+const lifecycleWorkerFixture = "function resolveLifecycleCoordinatorPath(Ot,Zt){let _n=resolvePathViaExistingAncestorSync(Zt.databasePath),Dn=resolvePathViaExistingAncestorSync(Zt.runtimeDirectory),kn=Zt.uid===void 0?`openclaw-state-locks`:`openclaw-state-locks-${Zt.uid}`;return path.join(Dn,kn,`${Ot}.${sha256HexPrefixCore(_n,8)}.lock.sqlite`)}"
+const lifecycleFixtures = [
+  ['dist/state-database-coordinator-fixture.js', lifecycleReadableFixture],
+  ['dist/config-doctor/official-external-plugin-catalog-snapshot-store-fixture.js', lifecycleReadableFixture],
+  ['dist/worker/worker.mjs', lifecycleWorkerFixture],
+]
+async function addLifecycleFixtures(root, branded = false) {
+  for (const [name, body] of lifecycleFixtures) {
+    const path = join(root, name)
+    await mkdir(join(path, '..'), {recursive: true})
+    let existing = ''
+    try { existing = await readFile(path, 'utf8') } catch {}
+    await writeFile(path, existing + '\n' + (branded ? body.replaceAll('openclaw-state-locks', 'uniopc-state-locks') : body))
+  }
+}
+
+test('archive lifecycle gate rejects each unpatched role on every platform', async t => {
+  for (const platform of ['linux', 'darwin', 'win32']) {
+    for (const [name, body] of lifecycleFixtures) {
+      const fixture = await nativeArchive(t, {platform})
+      const path = join(fixture.engine, name)
+      const before = await readFile(path, 'utf8')
+      await writeFile(path, before.replace(body.replaceAll('openclaw-state-locks','uniopc-state-locks'), body))
+      execFileSync('tar', ['-czf', join(fixture.output, `uniopc-engine-runtime-${platform}-x64.tar.gz`), '-C', join(fixture.root,'stage'), 'tools'])
+      await assert.rejects(verifyRuntimeDirectory(fixture.output), /Lifecycle coordinator.*suffix patch missing/)
+    }
+  }
+})
+
+test('archive lifecycle gate rejects commented, string and nested fake helpers in every role', async t => {
+  for (const [name, body] of lifecycleFixtures) for (const wrapper of [
+    source => '/*' + source + '*/',
+    source => 'const fake = ' + JSON.stringify(source) + ';',
+    source => 'function wrapper(){' + source + '}',
+  ]) {
+    const fixture = await nativeArchive(t, {platform: 'linux'})
+    const path = join(fixture.engine, name)
+    const branded = body.replaceAll('openclaw-state-locks', 'uniopc-state-locks')
+    await writeFile(path, (await readFile(path, 'utf8')).replace(branded, wrapper(branded)))
+    execFileSync('tar', ['-czf', join(fixture.output, 'uniopc-engine-runtime-linux-x64.tar.gz'), '-C', join(fixture.root, 'stage'), 'tools'])
+    await assert.rejects(verifyRuntimeDirectory(fixture.output), /Lifecycle coordinator.*(?:structure drift|top-level)/)
+  }
 })

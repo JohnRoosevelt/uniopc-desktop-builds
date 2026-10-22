@@ -2,7 +2,8 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import path, { join } from 'node:path'
+import { createHash } from 'node:crypto'
 
 import { rebrandEngineWrapperContract, rebrandPluginManifestPaths, rebrandCompiledRuntimePaths, rebrandDisplayMetadata, rebrandVisibleText } from './uniopc-runtime-branding.mjs'
 
@@ -56,6 +57,7 @@ test('renames compiled chunks and references while preserving plugin manifest na
     await writeFile(join(dist, 'openclaw-wallpaper.png'), Buffer.from([137, 80, 78, 71]))
     await writeFile(join(dist, 'paths-HASH.js'), 'const suffix = uid != null ? `openclaw-${uid}` : "openclaw";')
     await writeFile(join(dist, 'extensions', 'demo', 'openclaw.plugin.json'), '{}')
+    await addLifecycleFixtures(root)
     await rebrandCompiledRuntimePaths(root)
     assert.ok((await readdir(dist)).includes('uniopc-root-HASH.js'))
     assert.ok((await readdir(dist)).includes('uniopc-wallpaper.png'))
@@ -117,4 +119,71 @@ test('wrapper contract repair is idempotent and rejects unsupported entry layout
     await writeFile(entry, 'new unsupported entry')
     await assert.rejects(rebrandEngineWrapperContract(root), /wrapper contract changed/)
   } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+// Verbatim path functions from the installed pinned engine, independent of production constants.
+const lifecycleReadableFixture = "function resolveLifecycleCoordinatorPath(family, params) {\n\tconst canonicalDatabasePath = resolvePathViaExistingAncestorSync(params.databasePath);\n\tconst canonicalRuntimeDirectory = resolvePathViaExistingAncestorSync(params.runtimeDirectory);\n\tconst suffix = params.uid === void 0 ? \"openclaw-state-locks\" : `openclaw-state-locks-${params.uid}`;\n\treturn path.join(canonicalRuntimeDirectory, suffix, `${family}.${sha256HexPrefixCore(canonicalDatabasePath, 8)}.lock.sqlite`);\n}"
+const lifecycleWorkerFixture = "function resolveLifecycleCoordinatorPath(Ot,Zt){let _n=resolvePathViaExistingAncestorSync(Zt.databasePath),Dn=resolvePathViaExistingAncestorSync(Zt.runtimeDirectory),kn=Zt.uid===void 0?`openclaw-state-locks`:`openclaw-state-locks-${Zt.uid}`;return path.join(Dn,kn,`${Ot}.${sha256HexPrefixCore(_n,8)}.lock.sqlite`)}"
+const lifecycleFixtures = [
+  ['dist/state-database-coordinator-fixture.js', lifecycleReadableFixture],
+  ['dist/config-doctor/official-external-plugin-catalog-snapshot-store-fixture.js', lifecycleReadableFixture],
+  ['dist/worker/worker.mjs', lifecycleWorkerFixture],
+]
+async function addLifecycleFixtures(root, branded = false) {
+  for (const [name, body] of lifecycleFixtures) {
+    const path = join(root, name)
+    await mkdir(join(path, '..'), {recursive: true})
+    let existing = ''
+    try { existing = await readFile(path, 'utf8') } catch {}
+    await writeFile(path, existing + '\n' + (branded ? body.replaceAll('openclaw-state-locks', 'uniopc-state-locks') : body))
+  }
+}
+
+test('lifecycle preflight rejects missing, duplicate, drifted and extra legacy suffixes without writes', async t => {
+  for (const variant of ['missing', 'duplicate', 'duplicate-file', 'drift', 'extra', 'comment', 'string', 'nested']) {
+    const root = await mkdtemp(join(tmpdir(), 'uniopc-lock-preflight-'))
+    t.after(() => rm(root, {recursive: true, force: true}))
+    await addLifecycleFixtures(root)
+    await writeFile(join(root, 'dist/paths-fixture.js'), 'const suffix = uid != null ? `openclaw-${uid}` : "openclaw";')
+    await writeFile(join(root, 'dist/openclaw-chunk.js'), 'const x = true;')
+    const file = join(root, lifecycleFixtures[1][0])
+    if (variant === 'missing') await rm(file)
+    if (variant === 'duplicate') await writeFile(file, lifecycleReadableFixture + '\n' + lifecycleReadableFixture)
+    if (variant === 'duplicate-file') await writeFile(join(root, 'dist/state-database-coordinator-duplicate.js'), 'const unused = true;')
+    if (variant === 'drift') await writeFile(file, lifecycleReadableFixture.replace('canonicalDatabasePath, 8', 'canonicalDatabasePath, 9'))
+    if (variant === 'comment') await writeFile(file, '/*' + lifecycleReadableFixture + '*/')
+    if (variant === 'string') await writeFile(file, 'const fake = ' + JSON.stringify(lifecycleReadableFixture) + ';')
+    if (variant === 'nested') await writeFile(file, 'function wrapper(){' + lifecycleReadableFixture + '}')
+    if (variant === 'extra') await writeFile(join(root, 'dist/extra.js'), 'const x="openclaw-state-locks";')
+    const snapshot = async () => {
+      const result = []
+      async function walk(dir) {
+        for (const e of await readdir(dir, {withFileTypes:true})) {
+          const path = join(dir, e.name)
+          if (e.isDirectory()) await walk(path)
+          else result.push([path, await readFile(path, 'utf8')])
+        }
+      }
+      await walk(root)
+      return result
+    }
+    const before = await snapshot()
+    await assert.rejects(rebrandCompiledRuntimePaths(root), /Lifecycle coordinator/)
+    assert.deepEqual(await snapshot(), before, variant)
+  }
+})
+
+test('pinned main, config-doctor and worker derivations retain database hashes and both lifecycle families', () => {
+  const databasePath = path.resolve('/state/main.sqlite')
+  const runtimeDirectory = path.resolve('/profile/Uniopc/locks')
+  const hash = createHash('sha256').update(databasePath).digest('hex').slice(0, 8)
+  for (const [, body] of lifecycleFixtures) {
+    const derive = new Function('path', 'resolvePathViaExistingAncestorSync', 'sha256HexPrefixCore',
+      body.replaceAll('openclaw-state-locks', 'uniopc-state-locks') + ';return resolveLifecycleCoordinatorPath;')(
+        path, path.resolve, (value, length) => createHash('sha256').update(value).digest('hex').slice(0, length))
+    for (const uid of [undefined, 501]) for (const family of ['gateway-lifecycle', 'state-lifecycle']) {
+      assert.equal(derive(family, {databasePath, runtimeDirectory, uid}),
+        join(runtimeDirectory, `uniopc-state-locks${uid === undefined ? '' : '-501'}`, `${family}.${hash}.lock.sqlite`))
+    }
+  }
 })
