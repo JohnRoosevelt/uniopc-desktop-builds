@@ -155,7 +155,7 @@ fn select_bundled_runtime_archive(app: &AppHandle) -> Result<(RuntimeArtifact, P
     }
     if !node_version_is_supported(&artifact.node_version) {
         return Err(format!(
-            "内置 Node.js 版本 {} 不满足 OpenClaw 8.1 运行时要求。",
+            "内置 Node.js 版本 {} 不满足 Uniopc 引擎 8.1 运行时要求。",
             artifact.node_version
         ));
     }
@@ -1160,7 +1160,7 @@ pub fn ensure_bundled_runtime_installed(app: &AppHandle) -> Result<BundledRuntim
                     != artifact.node_version.trim_start_matches('v')
             {
                 return Err(format!(
-                    "解压后的 Node.js 版本 {staged_node} 不满足 OpenClaw 8.1 运行时要求。"
+                    "解压后的 Node.js 版本 {staged_node} 不满足 Uniopc 引擎 8.1 运行时要求。"
                 ));
             }
             for subtree in RUNTIME_SUBTREES {

@@ -13,6 +13,7 @@ export const RUNTIME_MODULES = [
   'scripts/build-openclaw-runtime-bundle.mjs',
   'scripts/uniopc-runtime-scopes.mjs',
   'scripts/uniopc-runtime-branding.mjs',
+  'scripts/uniopc-skill-branding.mjs',
   'scripts/verify-openclaw-release-contract.mjs',
   'scripts/verify-uniopc-whitelabel-runtime.mjs',
 ]

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { isManagedSkillMarkdown, skillBrandOccurrences } from './uniopc-skill-branding.mjs'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
@@ -291,6 +292,13 @@ export async function verifyRuntimeDirectory(runtimeDirectory = RUNTIME_DIR) {
         if (internalReason) {
           const count = countBrandOccurrences(text)
           if (count) internalTextResiduals.set(normalized, { count, reason: internalReason })
+          return
+        }
+        const engineRelative = normalized.replace(BRANDED_ENGINE_ROOT, '')
+        if (BRANDED_ENGINE_ROOT.test(normalized) && isManagedSkillMarkdown(engineRelative)) {
+          for (const occurrence of skillBrandOccurrences(text)) {
+            textViolations.push(`${normalized}:${text.slice(0, occurrence.start).split('\n').length}`)
+          }
           return
         }
         if (/\.json$/i.test(normalized)) {

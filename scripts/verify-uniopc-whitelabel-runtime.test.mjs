@@ -311,6 +311,7 @@ test('standalone Windows archive verifier and VM uniqueness checks work without 
   execFileSync('tar',['-czf',join(fixture.output,'uniopc-engine-runtime-win32-x64.tar.gz'),'-C',join(fixture.root,'stage'),'tools'])
   const script=join(fixture.root,'verify.mjs')
   await writeFile(script,await readFile(new URL('./verify-uniopc-whitelabel-runtime.mjs',import.meta.url)))
+  await writeFile(join(fixture.root,'uniopc-skill-branding.mjs'),await readFile(new URL('./uniopc-skill-branding.mjs',import.meta.url)))
   const env={...process.env}
   for(const key of Object.keys(env))if(['NODE_PATH','NODE_OPTIONS'].includes(key.toUpperCase()))delete env[key]
   assert.ok(!(await readdir(fixture.root)).includes('node_modules'))
@@ -347,4 +348,27 @@ test('Windows native archive collection rejects invalid UTF-8, NUL and preserved
       await assert.rejects(verifyRuntimeDirectory(fixture.output),error,role)
     }
   }
+})
+
+test('archive gate audits only managed Skill prose and rejects unconverted descriptions and body', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'uniopc-skill-archive-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const stage = join(root, 'stage')
+  const engine = join(stage, 'tools/node/lib/node_modules/uniopc-engine')
+  const templates = join(engine, 'docs/reference/templates')
+  await mkdir(templates, { recursive: true })
+  for (const name of ['AGENTS', 'SOUL', 'TOOLS', 'IDENTITY', 'USER', 'BOOTSTRAP']) await writeFile(join(templates, `${name}.md`), 'Uniopc')
+  const skill = join(engine, 'skills/healthcheck/SKILL.md')
+  await mkdir(join(skill, '..'), { recursive: true })
+  const archive = 'uniopc-engine-runtime-linux-x64.tar.gz'
+  await writeFile(join(root, 'uniopc-engine-runtime.catalog.json'), JSON.stringify({ artifacts: [{ archive, platform: 'linux', arch: 'x64' }] }))
+  const repack = () => execFileSync('tar', ['-czf', join(root, archive), '-C', stage, 'tools'])
+  for (const text of ['---\ndescription: OpenClaw hosts\n---\n', '# OPENCLAW host healthcheck', '# 小龙虾', '`](example`\nOpenClaw prose']) {
+    await writeFile(skill, text)
+    repack()
+    await assert.rejects(verifyRuntimeDirectory(root), /skills\/healthcheck\/SKILL.md/)
+  }
+  await writeFile(skill, '---\nname: OpenClaw\ndescription: Uniopc hosts\nmetadata: { brand: OpenClaw }\n---\n`OpenClaw` https://github.com/OpenClaw/example\nCopyright (c) 2026 OpenClaw Foundation\nopenclaw security audit --deep\nOPENCLAW_STATE_DIR OpenClawConfig\n')
+  repack()
+  assert.equal((await verifyRuntimeDirectory(root)).artifactCount, 1)
 })

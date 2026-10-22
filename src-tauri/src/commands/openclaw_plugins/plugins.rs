@@ -485,7 +485,7 @@ pub(super) mod implementation {
             return Ok(());
         }
         Err(format!(
-            "插件 `{}` 仍是旧版包，无法在 OpenClaw 8.1 中安全写入凭据；请回到插件市场更新后再启用。",
+            "插件 `{}` 仍是旧版包，无法在 Uniopc 引擎 8.1 中安全写入凭据；请回到插件市场更新后再启用。",
             definition.title
         ))
     }

@@ -1610,7 +1610,7 @@ fn gateway_runtime_matches_active(active_runtime_id: Option<&str>, child_runtime
 fn require_verified_openclaw_runtime(verified: bool) -> Result<(), String> {
     verified
         .then_some(())
-        .ok_or_else(|| "OpenClaw 8.1 运行时未验证。".to_string())
+        .ok_or_else(|| "Uniopc 引擎 8.1 运行时未验证。".to_string())
 }
 
 // Leave time for OpenClaw's async server close and clean_stop lifecycle write.
@@ -1959,7 +1959,7 @@ impl GatewaySupervisor {
             return Err("gateway_startup_termination_unconfirmed".into());
         }
         let active_runtime_id = crate::services::openclaw_bundled_runtime::current_runtime_version()
-            .ok_or_else(|| "OpenClaw 8.1 运行时未验证。".to_string())?;
+            .ok_or_else(|| "Uniopc 引擎 8.1 运行时未验证。".to_string())?;
         require_verified_openclaw_runtime(true)?;
         let runtime_mismatch = {
             let mut guard = self.child.lock().await;
@@ -12080,7 +12080,7 @@ mod tests {
     fn gateway_supervisor_rejects_an_unverified_runtime() {
         assert_eq!(
             require_verified_openclaw_runtime(false).unwrap_err(),
-            "OpenClaw 8.1 运行时未验证。"
+            "Uniopc 引擎 8.1 运行时未验证。"
         );
         assert!(require_verified_openclaw_runtime(true).is_ok());
     }

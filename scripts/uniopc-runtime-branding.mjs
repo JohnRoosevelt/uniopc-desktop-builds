@@ -1,3 +1,4 @@
+import { isManagedSkillMarkdown, rebrandSkillMarkdown } from './uniopc-skill-branding.mjs'
 import { readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
 import { basename, join, relative } from 'node:path'
 
@@ -68,6 +69,15 @@ async function walk(directory, callback) {
 export async function rebrandRuntimeTree(packageRoot) {
   const changed = []
   await walk(packageRoot, async path => {
+    if (isManagedSkillMarkdown(relative(packageRoot, path))) {
+      const before = await readFile(path, 'utf8')
+      const after = rebrandSkillMarkdown(before)
+      if (after !== before) {
+        await writeFile(path, after, 'utf8')
+        changed.push(path)
+      }
+      return
+    }
     if (/\.html$/i.test(path)) {
       const before = await readFile(path, 'utf8')
       const after = rebrandVisibleText(before)

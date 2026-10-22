@@ -370,13 +370,13 @@ async fn managed_tab_websocket(profile: Option<&str>, target_id: &str) -> Result
         return Err("Browser Runtime 已关闭，请在运行中心启用后重试。".to_string());
     }
     if !browser_tool_policy_ready(&config) { return Err("Browser 工具策略未启用，已停止控制页面。".to_string()); }
-    let managed = config.pointer("/browser/profiles/openclaw").ok_or("没有找到当前工作区的 OpenClaw 浏览器配置。")?;
+    let managed = config.pointer("/browser/profiles/openclaw").ok_or("没有找到当前工作区的 Uniopc 工作区浏览器配置。")?;
     if managed.get("driver").and_then(Value::as_str) != Some("openclaw")
         || managed.get("cdpUrl").is_some_and(|value| !value.is_null())
         || managed.get("userDataDir").is_some_and(|value| !value.is_null())
         || managed.get("attachOnly").and_then(Value::as_bool) != Some(false)
     {
-        return Err("当前工作区没有使用隔离托管的 OpenClaw 浏览器，已拒绝连接其他浏览器。".to_string());
+        return Err("当前工作区没有使用隔离托管的 Uniopc 工作区浏览器，已拒绝连接其他浏览器。".to_string());
     }
     let port = managed.get("cdpPort").and_then(Value::as_u64).ok_or("没有找到当前工作区的 Browser Runtime CDP 端口。")?;
     let expected_port = managed_browser_cdp_port(&profile_key)? as u64;
@@ -387,7 +387,7 @@ async fn managed_tab_websocket(profile: Option<&str>, target_id: &str) -> Result
         return Err("当前工作区的浏览器未连接，请先在运行中心连接该工作区。".to_string());
     }
     if !browser_status_is_ready(&status) {
-        return Err("当前工作区的 OpenClaw Browser Runtime 尚未就绪，已停止读取或控制标签。".to_string());
+        return Err("当前工作区的 Uniopc 工作区浏览器尚未就绪，已停止读取或控制标签。".to_string());
     }
     let url = format!("http://127.0.0.1:{port}/json/list");
     let tabs: Vec<Value> = reqwest::Client::new().get(url).timeout(std::time::Duration::from_secs(3)).send().await.map_err(|e| format!("连接工作区 Browser Runtime 失败：{e}"))?.error_for_status().map_err(|e| format!("读取 Browser Runtime 标签失败：{e}"))?.json().await.map_err(|e| format!("解析 Browser Runtime 标签失败：{e}"))?;
@@ -703,7 +703,7 @@ pub async fn browser_dock_snapshot(profile: Option<&str>) -> Result<BrowserDockS
         && profile_config.and_then(|value| value.get("cdpUrl")).is_none_or(Value::is_null)
         && profile_config.and_then(|value| value.get("userDataDir")).is_none_or(Value::is_null);
     if !local_managed {
-        return Ok(BrowserDockSnapshot { profile: profile_key, status: "unsupported_target".to_string(), message: "右侧实时面板只支持本机隔离托管的 OpenClaw 浏览器。".to_string(), tabs: Vec::new(), local_managed: false });
+        return Ok(BrowserDockSnapshot { profile: profile_key, status: "unsupported_target".to_string(), message: "右侧实时面板只支持本机隔离托管的 Uniopc 工作区浏览器。".to_string(), tabs: Vec::new(), local_managed: false });
     }
     if !browser_enabled_from_config(&config) {
         return Ok(BrowserDockSnapshot { profile: profile_key, status: "disabled".to_string(), message: "Browser Runtime 已关闭，请在运行中心启用。".to_string(), tabs: Vec::new(), local_managed });
